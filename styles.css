@@ -162,44 +162,90 @@ a:hover {
   color: var(--accent-hover);
 }
 
+.md-token { font: inherit; }
+/* Default live-edit mode: hide markdown markers unless caret is inside the token span. */
+.md-token-hidden {
+  font-size: 0;
+  opacity: 0;
+  user-select: none;
+  pointer-events: none;
+}
+.md-token-visible {
+  color: var(--text-secondary);
+  opacity: 0.9;
+  user-select: auto;
+  pointer-events: auto;
+}
+
+/* Optional source-accuracy mode from toolbar button. */
+.editor-surface.show-syntax .md-token-hidden {
+  font-size: inherit;
+  color: var(--text-secondary);
+  opacity: 0.9;
+  user-select: auto;
+  pointer-events: auto;
+}
+
 /* Markdown Highlight Styles for In-Place Editor */
 .hl-h1,
 .hl-h2,
 .hl-h3,
-.hl-h4 {
+.hl-h4,
+.hl-h5,
+.hl-h6 {
   font-weight: 700;
 }
 
 .hl-h1 {
   font-size: 2em;
+  font-weight: 700;
   color: var(--md-h1-color, var(--text-primary));
   border-bottom: 1px solid var(--border-color);
-  padding-bottom: 0.3em;
-  margin-bottom: 0.5em;
-  display: inline-block;
-  width: 100%;
+  padding-bottom: 0.1em;
+  margin: 0;
+  line-height: inherit;
 }
 
 .hl-h2 {
   font-size: 1.5em;
+  font-weight: 700;
   color: var(--md-h2-color, var(--text-primary));
   border-bottom: 1px solid var(--border-color);
-  padding-bottom: 0.3em;
-  margin-bottom: 0.5em;
-  display: inline-block;
-  width: 100%;
+  padding-bottom: 0.1em;
+  margin: 0;
+  line-height: inherit;
 }
 
 .hl-h3 {
   font-size: 1.25em;
+  font-weight: 700;
   color: var(--md-h3-color, var(--text-primary));
-  margin-top: 1.5em;
+  margin: 0;
+  line-height: inherit;
 }
 
 .hl-h4 {
   font-size: 1.1em;
+  font-weight: 700;
   color: var(--md-h4-color, var(--text-primary));
-  margin-top: 1.5em;
+  margin: 0;
+  line-height: inherit;
+}
+
+.hl-h5 {
+  font-size: 1.02em;
+  font-weight: 700;
+  color: var(--md-h4-color, var(--text-primary));
+  margin: 0;
+  line-height: inherit;
+}
+
+.hl-h6 {
+  font-size: 0.95em;
+  font-weight: 700;
+  color: color-mix(in srgb, var(--md-h4-color, var(--text-primary)) 85%, var(--text-muted));
+  margin: 0;
+  line-height: inherit;
 }
 
 .hl-bold {
@@ -220,12 +266,116 @@ a:hover {
   border-radius: 4px;
 }
 
+.hl-codeblock {
+  font-family: var(--font-mono);
+  color: var(--md-code-text, var(--text-primary));
+  background: color-mix(in srgb, var(--md-code-bg, var(--bg-tertiary)) 75%, transparent);
+}
+
+.hl-code-fence {
+  color: color-mix(in srgb, var(--md-code-text, var(--text-primary)) 75%, var(--text-muted));
+}
+
+.hl-link {
+  color: var(--accent-color);
+  text-decoration: underline;
+  text-underline-offset: 0.18em;
+}
+
+.hl-embed {
+  color: color-mix(in srgb, var(--accent-color) 80%, #0ea5e9);
+  text-decoration: none;
+  font-weight: 600;
+}
+
+.hl-tag {
+  color: color-mix(in srgb, var(--accent-color) 85%, #0ea5e9);
+  font-weight: 600;
+}
+
+.hl-strike {
+  text-decoration: line-through;
+  text-decoration-thickness: 0.08em;
+  color: var(--text-muted);
+}
+
+.hl-mark {
+  background: color-mix(in srgb, #fde047 35%, transparent);
+  color: inherit;
+  border-radius: 3px;
+}
+
+.hl-math-inline {
+  font-family: var(--font-mono);
+  color: color-mix(in srgb, var(--accent-color) 82%, var(--text-primary));
+}
+
+.hl-math-block {
+  font-family: var(--font-mono);
+  color: color-mix(in srgb, var(--accent-color) 82%, var(--text-primary));
+  background: color-mix(in srgb, var(--bg-tertiary) 70%, transparent);
+}
+
+.hl-footnote,
+.hl-footnote-def {
+  color: color-mix(in srgb, var(--accent-color) 78%, var(--text-primary));
+}
+
+.hl-block-id {
+  color: color-mix(in srgb, var(--accent-color) 65%, var(--text-muted));
+  font-family: var(--font-mono);
+}
+
+.hl-comment {
+  color: var(--text-muted);
+  opacity: 0.85;
+  font-style: italic;
+}
+
+.hl-frontmatter {
+  color: color-mix(in srgb, var(--text-muted) 92%, var(--accent-color));
+  font-family: var(--font-mono);
+  background: color-mix(in srgb, var(--bg-tertiary) 65%, transparent);
+}
+
 .hl-quote {
   color: var(--md-quote-color, var(--text-muted));
   font-style: italic;
   opacity: 0.8;
   border-left: 0.25em solid var(--md-quote-color, var(--border-color));
-  padding-left: 1em;
-  display: inline-block;
-  margin-top: 0.5em;
+  padding-left: 0.5em;
+  margin: 0;
+  line-height: inherit;
+}
+
+.hl-task {
+  color: var(--text-primary);
+}
+
+.hl-list {
+  color: var(--text-primary);
+}
+
+.hl-callout {
+  color: var(--text-primary);
+  background: color-mix(in srgb, var(--accent-color) 10%, transparent);
+  border-left: 0.25em solid color-mix(in srgb, var(--accent-color) 60%, transparent);
+  padding-left: 0.5em;
+}
+
+.hl-hr {
+  color: var(--text-muted);
+  letter-spacing: 0.08em;
+}
+
+.hl-table {
+  color: var(--text-primary);
+  background: color-mix(in srgb, var(--bg-tertiary) 50%, transparent);
+}
+
+.meta-block {
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--bg-primary) 75%, transparent);
+  padding: 0.65rem 0.75rem;
 }

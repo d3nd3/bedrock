@@ -20,7 +20,24 @@ The interface is split into two primary areas:
 
 ### The Editor Pane (Right)
 This is the core of Bedrock. It features a lightning-fast *In-Place* Markdown Editor. 
-As you type raw markdown syntax (`# Headers`, `**bold**`, `- lists`, etc) the editor will dynamically identify and style the markdown elements in-place with beautiful typography using overlapping transparent highlight layers.
+As you type raw markdown syntax (`# Headers`, `**bold**`, `- lists`, etc) the editor dynamically styles markdown in a single editable surface so caret/selection geometry always matches rendered typography.
+
+### Advanced Editing (Bedrock Native)
+- **Smart keybindings**:
+  - `Cmd/Ctrl + B`: Wrap selection with `**bold**`
+  - `Cmd/Ctrl + I`: Wrap selection with `*italic*`
+  - `Cmd/Ctrl + K`: Wrap selection with `[[wikilink]]`
+  - `Tab` / `Shift+Tab`: Indent and outdent current line or selected block
+  - `Enter` on list/quote/task lines continues the structure automatically
+- **Auto-pairing** for `()`, `[]`, `{}`, quotes, and backticks.
+- **Formatting toolbar** above the editor for quick markdown actions.
+- **Syntax visibility toggle** in the toolbar:
+  - Default: markdown markers are hidden unless the caret is inside that markdown span.
+  - Optional: click **Show Markdown** to reveal marker tokens more explicitly.
+- **Debounced safe-save** behavior while typing (shows `Saving...` / `Saved` status).
+- **Rename note support** from the note header with automatic wiki-link rewrites across the vault.
+- **Core edit kernel**: editor commands are applied through a transaction-based `editor_core`, giving consistent behavior across shortcuts, toolbar, and future plugins.
+- **IME + Paste hardened**: composition input is handled safely (no mid-composition re-render jumps), and paste is normalized to plain text through the transaction pipeline.
 
 ## 3. Customizing the Theme (Settings UI & Plugins)
 Bedrock gives you absolute control over your visual environment. 
@@ -47,6 +64,13 @@ Bedrock supports all standard, fast markdown entry formats.
 - `**bold**`
 - `> ` for blockquotes
 - ` ``` ` for code blocks
+
+The right-side **Metadata Cache** panel continuously indexes:
+- tags
+- headings (with line numbers)
+- outgoing links
+- backlinks
+- unresolved links
 
 Writing is saved instantly to the local disk as soon as you type.
 
