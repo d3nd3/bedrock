@@ -79,7 +79,10 @@ fn normalize_vault_session_state(state: VaultSessionState) -> VaultSessionState 
                 return Some(canon.to_string_lossy().to_string());
             }
         }
-        Some(trimmed.to_string())
+        if candidate.is_absolute() {
+            return Some(trimmed.to_string());
+        }
+        None
     };
 
     let mut open_vaults = Vec::<String>::new();
@@ -96,8 +99,12 @@ fn normalize_vault_session_state(state: VaultSessionState) -> VaultSessionState 
     let mut active_vault = state.active_vault.and_then(|raw| normalize_path(&raw));
 
     if let Some(active) = active_vault.clone() {
-        if !open_vaults.iter().any(|p| p == &active) {
-            open_vaults.push(active);
+        if let Some(existing) = open_vaults.iter().find(|p| *p == &active) {
+            active_vault = Some(existing.clone());
+        } else if let Some(first) = open_vaults.first().cloned() {
+            active_vault = Some(first);
+        } else {
+            active_vault = Some(active);
         }
     } else if let Some(first) = open_vaults.first().cloned() {
         active_vault = Some(first);
@@ -224,6 +231,30 @@ fn collect_note_paths(vault_path: &str) -> Result<Vec<String>, String> {
     collect_markdown_files(root, root, &mut entries)?;
     entries.sort();
     Ok(entries)
+}
+
+fn collect_relative_dirs(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<(), String> {
+    let read_dir = fs::read_dir(dir).map_err(|e| e.to_string())?;
+    for entry in read_dir {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if path.is_dir() && !entry.file_name().to_string_lossy().starts_with('.') {
+            let rel = path
+                .strip_prefix(root)
+                .map_err(|e| e.to_string())?
+                .to_string_lossy()
+                .replace('\\', "/");
+            out.push(rel);
+            collect_relative_dirs(root, &path, out)?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct ReadDirResult {
+    notes: Vec<String>,
+    empty_dirs: Vec<String>,
 }
 
 fn ensure_bedrock_layout(vault_path: &Path) -> Result<(), String> {
@@ -558,8 +589,21 @@ fn rewrite_wiki_links(
 }
 
 #[tauri::command]
-fn read_dir(path: &str) -> Result<Vec<String>, String> {
-    collect_note_paths(path)
+fn read_dir(path: &str) -> Result<ReadDirResult, String> {
+    let root = Path::new(path);
+    if !root.exists() {
+        return Ok(ReadDirResult { notes: Vec::new(), empty_dirs: Vec::new() });
+    }
+    let notes = collect_note_paths(path)?;
+    let mut all_dirs = Vec::new();
+    collect_relative_dirs(root, root, &mut all_dirs)?;
+    let empty_dirs = all_dirs
+        .into_iter()
+        .filter(|d| {
+            !notes.iter().any(|n| n == d || n.starts_with(&format!("{d}/")))
+        })
+        .collect();
+    Ok(ReadDirResult { notes, empty_dirs })
 }
 
 #[tauri::command]
@@ -576,6 +620,21 @@ fn read_file_base64(path: &str) -> Result<String, String> {
 #[tauri::command]
 fn write_file(path: &str, content: &str) -> Result<(), String> {
     fs::write(path, content).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn create_dir(path: &str) -> Result<(), String> {
+    fs::create_dir_all(path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn delete_file(path: &str) -> Result<(), String> {
+    fs::remove_file(path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn delete_dir(path: &str) -> Result<(), String> {
+    fs::remove_dir_all(path).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -911,6 +970,9 @@ pub fn run() {
             read_file,
             read_file_base64,
             write_file,
+            create_dir,
+            delete_file,
+            delete_dir,
             read_vault_notes,
             rename_note,
             init_vault,

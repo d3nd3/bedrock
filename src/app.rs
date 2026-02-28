@@ -25,6 +25,11 @@ extern "C" {
 struct ReadDirArgs<'a> {
     path: &'a str,
 }
+#[derive(Deserialize)]
+struct ReadDirResult {
+    notes: Vec<String>,
+    empty_dirs: Vec<String>,
+}
 #[derive(Serialize)]
 struct ReadFileArgs<'a> {
     path: &'a str,
@@ -167,6 +172,12 @@ enum SidebarEntry {
         name: String,
         depth: usize,
     },
+}
+
+#[derive(Clone)]
+enum SidebarContextMenu {
+    Folder { path: String, x: f64, y: f64 },
+    File { path: String, x: f64, y: f64 },
 }
 
 struct InlineMatch {
@@ -416,6 +427,43 @@ fn finalize_folder_tree(nodes: &mut Vec<FolderTreeNode>) {
                 .map(|folder| folder.note_count)
                 .sum::<usize>();
     }
+}
+
+fn ensure_empty_folder_path(folders: &mut Vec<FolderTreeNode>, path_parts: &[&str], prefix: &str) {
+    if path_parts.is_empty() {
+        return;
+    }
+    let name = path_parts[0];
+    let path = if prefix.is_empty() {
+        name.to_string()
+    } else {
+        format!("{prefix}/{name}")
+    };
+    let idx = if let Some(pos) = folders.iter().position(|f| f.name == name) {
+        pos
+    } else {
+        folders.push(FolderTreeNode {
+            name: name.to_string(),
+            path: path.clone(),
+            folders: Vec::new(),
+            files: Vec::new(),
+            note_count: 0,
+        });
+        folders.len() - 1
+    };
+    if path_parts.len() > 1 {
+        ensure_empty_folder_path(&mut folders[idx].folders, &path_parts[1..], &path);
+    }
+}
+
+fn add_empty_dirs_to_tree(tree: &mut FileTree, empty_dirs: &[String]) {
+    for d in empty_dirs {
+        let parts: Vec<&str> = d.split('/').filter(|s| !s.is_empty()).collect();
+        if !parts.is_empty() {
+            ensure_empty_folder_path(&mut tree.folders, &parts, "");
+        }
+    }
+    finalize_folder_tree(&mut tree.folders);
 }
 
 fn build_file_tree(files: &[String]) -> FileTree {
@@ -1721,6 +1769,7 @@ pub fn App() -> impl IntoView {
     let (vault_path, set_vault_path) = signal(String::new());
     let (open_vaults, set_open_vaults) = signal(Vec::<String>::new());
     let (files, set_files) = signal(Vec::<String>::new());
+    let (empty_dirs, set_empty_dirs) = signal(Vec::<String>::new());
     let (note_texts, set_note_texts) = signal(HashMap::<String, String>::new());
     let (metadata_cache, set_metadata_cache) = signal(MetadataCacheState::default());
 
@@ -1743,6 +1792,7 @@ pub fn App() -> impl IntoView {
     let (save_status, set_save_status) = signal("Saved".to_string());
     let (show_markdown_syntax, set_show_markdown_syntax) = signal(false);
     let (expanded_folders, set_expanded_folders) = signal(HashSet::<String>::new());
+    let (sidebar_context_menu, set_sidebar_context_menu) = signal(Option::<SidebarContextMenu>::None);
     let (selection_restore_ticket, set_selection_restore_ticket) = signal(0u64);
     let (selection_sync_ticket, set_selection_sync_ticket) = signal(0u64);
 
@@ -1767,6 +1817,7 @@ pub fn App() -> impl IntoView {
 
     let clear_active_vault_state = move || {
         set_files.set(Vec::new());
+        set_empty_dirs.set(Vec::new());
         set_note_texts.set(HashMap::new());
         set_metadata_cache.set(MetadataCacheState::default());
         set_current_file.set(String::new());
@@ -1781,30 +1832,18 @@ pub fn App() -> impl IntoView {
         set_plugin_css.set(String::new());
     };
 
-    let register_open_vault = move |path: String| {
-        let normalized = collapse_path(&path);
-        if normalized.is_empty() {
-            return;
-        }
-        set_open_vaults.update(|vaults| {
-            if !vaults.iter().any(|p| collapse_path(p) == normalized) {
-                vaults.push(path.clone());
-            }
-        });
-    };
-
     let refresh_vault_snapshot = move |path: String, preferred_file: Option<String>| {
         spawn_local(async move {
             set_image_preview_cache.set(HashMap::new());
             set_image_preview_loading.set(HashSet::new());
             set_image_preview_failed.set(HashSet::new());
-            set_expanded_folders.set(HashSet::new());
 
             let dir_args = serde_wasm_bindgen::to_value(&ReadDirArgs { path: &path }).unwrap();
             let dir_val = invoke("read_dir", dir_args).await;
-            let dir_list =
-                serde_wasm_bindgen::from_value::<Vec<String>>(dir_val).unwrap_or_default();
-            set_files.set(dir_list.clone());
+            let dir_result =
+                serde_wasm_bindgen::from_value::<ReadDirResult>(dir_val).unwrap_or_else(|_| ReadDirResult { notes: Vec::new(), empty_dirs: Vec::new() });
+            set_files.set(dir_result.notes.clone());
+            set_empty_dirs.set(dir_result.empty_dirs.clone());
 
             let vault_args =
                 serde_wasm_bindgen::to_value(&VaultPathArgs { vault_path: &path }).unwrap();
@@ -1818,7 +1857,8 @@ pub fn App() -> impl IntoView {
             }
 
             set_note_texts.set(note_map.clone());
-            set_metadata_cache.set(build_metadata_cache(&note_map, &dir_list));
+            let dir_list = &dir_result.notes;
+            set_metadata_cache.set(build_metadata_cache(&note_map, dir_list));
 
             let next_file = preferred_file
                 .filter(|f| dir_list.contains(f))
@@ -1913,9 +1953,13 @@ pub fn App() -> impl IntoView {
         if path.is_empty() {
             return;
         }
+        let normalized = collapse_path(&path);
+        let mut open_now = open_vaults.get_untracked();
+        if !open_now.iter().any(|p| collapse_path(p) == normalized) {
+            open_now.push(path.clone());
+        }
+        set_open_vaults.set(open_now.clone());
         set_vault_path.set(path.clone());
-        register_open_vault(path.clone());
-        let open_now = open_vaults.get_untracked();
         persist_vault_session(open_now, Some(path.clone()));
         refresh_vault_snapshot(path.clone(), preferred_file);
         load_vault_visual_state(path);
@@ -1945,12 +1989,18 @@ pub fn App() -> impl IntoView {
             }
 
             if let Some(active_path) = active.clone() {
-                if !session
+                if let Some(existing) = session
                     .open_vaults
                     .iter()
-                    .any(|p| collapse_path(p) == collapse_path(&active_path))
+                    .find(|p| collapse_path(p) == collapse_path(&active_path))
+                    .cloned()
                 {
-                    session.open_vaults.push(active_path);
+                    active = Some(existing);
+                } else if let Some(first) = session.open_vaults.first().cloned() {
+                    active = Some(first);
+                } else {
+                    session.open_vaults.push(active_path.clone());
+                    active = Some(active_path);
                 }
             }
 
@@ -2629,6 +2679,101 @@ pub fn App() -> impl IntoView {
         }
     };
 
+    let create_note_in_folder = move |folder_path: String| {
+        set_sidebar_context_menu.set(None);
+        let v_path = vault_path.get_untracked();
+        if v_path.is_empty() {
+            return;
+        }
+        if let Ok(Some(raw)) = window().prompt_with_message_and_default("New note name", "New Note") {
+            let name = raw.trim().replace('\\', "/").trim_matches('/').to_string();
+            if name.is_empty() || name.contains('/') {
+                return;
+            }
+            let base = if name.to_ascii_lowercase().ends_with(".md") { name } else { format!("{name}.md") };
+            let filename = if folder_path.is_empty() { base } else { format!("{}/{}", folder_path, base) };
+            let file_path = format!("{}/{}", v_path, filename);
+            let initial = "# New Note\n\n".to_string();
+            let path_for_refresh = v_path.clone();
+            let file_for_refresh = filename.clone();
+            set_expanded_folders.update(|expanded| {
+                expand_parent_folders(expanded, &filename);
+            });
+            spawn_local(async move {
+                let args = serde_wasm_bindgen::to_value(&WriteFileArgs {
+                    path: &file_path,
+                    content: &initial,
+                })
+                .unwrap();
+                invoke("write_file", args).await;
+                refresh_vault_snapshot(path_for_refresh, Some(file_for_refresh));
+            });
+        }
+    };
+
+    let create_folder_in_folder = move |folder_path: String| {
+        set_sidebar_context_menu.set(None);
+        let v_path = vault_path.get_untracked();
+        if v_path.is_empty() {
+            return;
+        }
+        let default_name = "New folder";
+        if let Ok(Some(raw)) = window().prompt_with_message_and_default("New folder name", default_name) {
+            let name = normalize_rel_path(raw.trim());
+            if name.is_empty() || name.contains('/') {
+                return;
+            }
+            let full_path = if folder_path.is_empty() {
+                format!("{}/{}", v_path, name)
+            } else {
+                format!("{}/{}/{}", v_path, folder_path, name)
+            };
+            let path_for_refresh = v_path.clone();
+            spawn_local(async move {
+                let args = serde_wasm_bindgen::to_value(&ReadFileArgs { path: &full_path }).unwrap();
+                let _ = invoke("create_dir", args).await;
+                refresh_vault_snapshot(path_for_refresh, None);
+            });
+        }
+    };
+
+    let delete_note = move |file_path: String| {
+        set_sidebar_context_menu.set(None);
+        let v_path = vault_path.get_untracked();
+        if v_path.is_empty() || !window().confirm_with_message(&format!("Delete note \"{}\"?", file_path)).unwrap_or(false) {
+            return;
+        }
+        let full_path = format!("{}/{}", v_path, file_path);
+        let path_for_refresh = v_path.clone();
+        let next_file = if current_file.get_untracked() == file_path { None } else { Some(current_file.get_untracked().clone()) };
+        spawn_local(async move {
+            let args = serde_wasm_bindgen::to_value(&ReadFileArgs { path: &full_path }).unwrap();
+            let _ = invoke("delete_file", args).await;
+            refresh_vault_snapshot(path_for_refresh, next_file);
+        });
+    };
+
+    let delete_folder = move |folder_path: String| {
+        set_sidebar_context_menu.set(None);
+        let v_path = vault_path.get_untracked();
+        if v_path.is_empty() || !window().confirm_with_message(&format!("Delete folder \"{}\" and its contents?", folder_path)).unwrap_or(false) {
+            return;
+        }
+        let full_path = format!("{}/{}", v_path, folder_path);
+        let path_for_refresh = v_path.clone();
+        let current = current_file.get_untracked();
+        let next_file = if !current.is_empty() && current != folder_path && !current.starts_with(&format!("{}/", folder_path)) {
+            Some(current.clone())
+        } else {
+            None
+        };
+        spawn_local(async move {
+            let args = serde_wasm_bindgen::to_value(&ReadFileArgs { path: &full_path }).unwrap();
+            let _ = invoke("delete_dir", args).await;
+            refresh_vault_snapshot(path_for_refresh, next_file);
+        });
+    };
+
     let rename_current_note = move || {
         let v_path = vault_path.get_untracked();
         let old_name = current_file.get_untracked();
@@ -2947,7 +3092,8 @@ pub fn App() -> impl IntoView {
                                 }.into_any();
                             }
 
-                            let tree = build_file_tree(&files_in_vault);
+                            let mut tree = build_file_tree(&files_in_vault);
+                            add_empty_dirs_to_tree(&mut tree, &empty_dirs.get());
                             let rows = build_sidebar_entries(&tree, &expanded_folders.get());
 
                             view! {
@@ -2956,6 +3102,7 @@ pub fn App() -> impl IntoView {
                                         match row {
                                             SidebarEntry::Folder { path, name, depth, note_count, expanded } => {
                                                 let toggle_path = path.clone();
+                                                let context_path = path.clone();
                                                 let indent = 0.45 + (depth as f32 * 0.95);
                                                 let chevron = if expanded { "▾" } else { "▸" };
                                                 let row_bg = if expanded {
@@ -2979,6 +3126,10 @@ pub fn App() -> impl IntoView {
                                                                 }
                                                             });
                                                         }
+                                                        on:contextmenu=move |ev: leptos::ev::MouseEvent| {
+                                                            ev.prevent_default();
+                                                            set_sidebar_context_menu.set(Some(SidebarContextMenu::Folder { path: context_path.clone(), x: ev.client_x() as f64, y: ev.client_y() as f64 }));
+                                                        }
                                                         title=path
                                                     >
                                                         <span style="width: 0.8rem; text-align: center; color: var(--text-muted);">{chevron}</span>
@@ -2990,6 +3141,7 @@ pub fn App() -> impl IntoView {
                                             SidebarEntry::File { path, name, depth } => {
                                                 let filename = path.clone();
                                                 let active_path = path.clone();
+                                                let context_file_path = path.clone();
                                                 let is_active = move || current_file.get() == active_path;
                                                 let indent = 1.5 + (depth as f32 * 0.95);
 
@@ -3001,6 +3153,10 @@ pub fn App() -> impl IntoView {
                                                             if is_active() { "background: var(--accent-color); color: white;" } else { "color: var(--text-secondary);" }
                                                         )
                                                         on:click=move |_| select_file(filename.clone())
+                                                        on:contextmenu=move |ev: leptos::ev::MouseEvent| {
+                                                            ev.prevent_default();
+                                                            set_sidebar_context_menu.set(Some(SidebarContextMenu::File { path: context_file_path.clone(), x: ev.client_x() as f64, y: ev.client_y() as f64 }));
+                                                        }
                                                         title=path
                                                     >
                                                         {name}
@@ -3014,6 +3170,65 @@ pub fn App() -> impl IntoView {
                         }}
                     </div>
                 </nav>
+                {move || match sidebar_context_menu.get() {
+                    Some(SidebarContextMenu::Folder { path, x, y }) => {
+                        let path_for_note = path.clone();
+                        let path_for_folder = path.clone();
+                        let path_for_delete = path.clone();
+                        view! {
+                            <div
+                                style="position: fixed; inset: 0; z-index: 1000;"
+                                on:click=move |_| set_sidebar_context_menu.set(None)
+                            >
+                                <div
+                                    style=format!("position: absolute; left: {}px; top: {}px; background: var(--bg-secondary); border: 1px solid var(--border-color); border-radius: var(--radius-md); padding: 0.25rem 0; box-shadow: 0 4px 12px rgba(0,0,0,0.15); min-width: 8rem;", x, y)
+                                    on:click=move |ev| ev.stop_propagation()
+                                >
+                                    <button
+                                        style="display: block; width: 100%; padding: 0.4rem 0.75rem; text-align: left; font-size: 0.85rem; background: transparent; border: none; cursor: pointer; color: var(--text-primary);"
+                                        on:click=move |_| create_note_in_folder(path_for_note.clone())
+                                    >
+                                        "New note"
+                                    </button>
+                                    <button
+                                        style="display: block; width: 100%; padding: 0.4rem 0.75rem; text-align: left; font-size: 0.85rem; background: transparent; border: none; cursor: pointer; color: var(--text-primary);"
+                                        on:click=move |_| create_folder_in_folder(path_for_folder.clone())
+                                    >
+                                        "New folder"
+                                    </button>
+                                    <button
+                                        style="display: block; width: 100%; padding: 0.4rem 0.75rem; text-align: left; font-size: 0.85rem; background: transparent; border: none; cursor: pointer; color: var(--text-primary);"
+                                        on:click=move |_| delete_folder(path_for_delete.clone())
+                                    >
+                                        "Delete folder"
+                                    </button>
+                                </div>
+                            </div>
+                        }.into_any()
+                    }
+                    Some(SidebarContextMenu::File { path, x, y }) => {
+                        let path_for_delete = path.clone();
+                        view! {
+                            <div
+                                style="position: fixed; inset: 0; z-index: 1000;"
+                                on:click=move |_| set_sidebar_context_menu.set(None)
+                            >
+                                <div
+                                    style=format!("position: absolute; left: {}px; top: {}px; background: var(--bg-secondary); border: 1px solid var(--border-color); border-radius: var(--radius-md); padding: 0.25rem 0; box-shadow: 0 4px 12px rgba(0,0,0,0.15); min-width: 8rem;", x, y)
+                                    on:click=move |ev| ev.stop_propagation()
+                                >
+                                    <button
+                                        style="display: block; width: 100%; padding: 0.4rem 0.75rem; text-align: left; font-size: 0.85rem; background: transparent; border: none; cursor: pointer; color: var(--text-primary);"
+                                        on:click=move |_| delete_note(path_for_delete.clone())
+                                    >
+                                        "Delete note"
+                                    </button>
+                                </div>
+                            </div>
+                        }.into_any()
+                    }
+                    None => view! { <></> }.into_any(),
+                }}
                 <section class="editor-pane" style="flex: 1; display: flex; flex-direction: column; background: var(--bg-primary); min-width: 0;">
                     {move || if current_file.get().is_empty() {
                         let has_vault = !vault_path.get().is_empty();
