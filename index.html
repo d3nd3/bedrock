@@ -1,0 +1,24 @@
+<!doctype html>
+<html>
+
+<head>
+  <meta charset="utf-8" />
+  <title>Bedrock</title>
+  <link data-trunk rel="css" href="styles.css" />
+  <link data-trunk rel="copy-dir" href="public" />
+  <link data-trunk rel="rust" data-wasm-opt="z" />
+</head>
+
+<body>
+  <script>
+    window.addEventListener("DOMContentLoaded", () => {
+      if (window.__TAURI__ && window.__TAURI__.event) {
+        window.__TAURI__.event.listen('settings-updated', (e) => {
+          window.dispatchEvent(new CustomEvent('bedrock-settings', { detail: e.payload }));
+        });
+      }
+    });
+  </script>
+</body>
+
+</html>
