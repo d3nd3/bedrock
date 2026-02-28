@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=Bedrock
+Comment=Markup note-taking tool
+Exec=tauri-app
+Icon=com.bedrock.notes
+Type=Application
+Categories=Utility;TextEditor;
