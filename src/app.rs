@@ -2,13 +2,14 @@ use crate::editor_core::{
     apply_markdown_command, ChangeOrigin, EditorSnapshot, MarkdownCommand, Selection, TextChange,
     Transaction,
 };
+use js_sys::{Object, Reflect};
 use leptos::html;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos::web_sys::{HtmlElement, Node};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::OnceLock;
 use wasm_bindgen::prelude::*;
@@ -53,6 +54,26 @@ struct RenameNoteArgs<'a> {
 struct VaultNote {
     path: String,
     content: String,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+struct VaultImportReport {
+    success: bool,
+    cancelled: bool,
+    message: String,
+    source_vault: Option<String>,
+    destination_vault: Option<String>,
+    scanned_notes: usize,
+    imported_notes: usize,
+    scanned_images: usize,
+    imported_images: usize,
+    renamed_notes: usize,
+}
+
+#[derive(Deserialize, Clone, Debug, Default)]
+struct VaultSessionState {
+    open_vaults: Vec<String>,
+    active_vault: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -117,6 +138,37 @@ struct MetadataCacheState {
     tags_index: HashMap<String, Vec<String>>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct FolderTreeNode {
+    name: String,
+    path: String,
+    folders: Vec<FolderTreeNode>,
+    files: Vec<String>,
+    note_count: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+struct FileTree {
+    root_files: Vec<String>,
+    folders: Vec<FolderTreeNode>,
+}
+
+#[derive(Clone, Debug)]
+enum SidebarEntry {
+    Folder {
+        path: String,
+        name: String,
+        depth: usize,
+        note_count: usize,
+        expanded: bool,
+    },
+    File {
+        path: String,
+        name: String,
+        depth: usize,
+    },
+}
+
 struct InlineMatch {
     start: usize,
     end: usize,
@@ -126,6 +178,13 @@ struct InlineMatch {
     close_len: usize,
     class: &'static str,
     hide_tokens: bool,
+    preview_html: Option<String>,
+}
+
+struct ImageRenderContext<'a> {
+    vault_path: &'a str,
+    current_file: &'a str,
+    cache: &'a HashMap<String, String>,
 }
 
 fn is_escaped_at(bytes: &[u8], idx: usize) -> bool {
@@ -191,6 +250,7 @@ fn collect_delimited_matches(
                 close_len: token_len,
                 class,
                 hide_tokens,
+                preview_html: None,
             });
         } else {
             pending_open = Some(token);
@@ -209,6 +269,7 @@ fn collect_delimited_matches(
             close_len: 0,
             class,
             hide_tokens,
+            preview_html: None,
         });
     }
 
@@ -276,10 +337,427 @@ fn normalize_rel_path(path: &str) -> String {
     path.trim().replace('\\', "/").trim_matches('/').to_string()
 }
 
+fn vault_display_name(path: &str) -> String {
+    let normalized = normalize_slashes(path.trim().trim_end_matches('/'));
+    normalized
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or("Vault")
+        .to_string()
+}
+
+fn file_display_name(path: &str) -> String {
+    let normalized = normalize_slashes(path);
+    normalized
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(path)
+        .to_string()
+}
+
+fn insert_file_into_folders(
+    folders: &mut Vec<FolderTreeNode>,
+    folder_parts: &[&str],
+    file_path: &str,
+    prefix: &str,
+) {
+    if folder_parts.is_empty() {
+        return;
+    }
+
+    let name = folder_parts[0];
+    let path = if prefix.is_empty() {
+        name.to_string()
+    } else {
+        format!("{prefix}/{name}")
+    };
+
+    let idx = if let Some(pos) = folders.iter().position(|f| f.name == name) {
+        pos
+    } else {
+        folders.push(FolderTreeNode {
+            name: name.to_string(),
+            path: path.clone(),
+            folders: Vec::new(),
+            files: Vec::new(),
+            note_count: 0,
+        });
+        folders.len() - 1
+    };
+
+    if folder_parts.len() == 1 {
+        folders[idx].files.push(file_path.to_string());
+    } else {
+        insert_file_into_folders(
+            &mut folders[idx].folders,
+            &folder_parts[1..],
+            file_path,
+            &path,
+        );
+    }
+}
+
+fn finalize_folder_tree(nodes: &mut Vec<FolderTreeNode>) {
+    nodes.sort_by(|a, b| {
+        a.name
+            .to_ascii_lowercase()
+            .cmp(&b.name.to_ascii_lowercase())
+    });
+    for node in nodes.iter_mut() {
+        finalize_folder_tree(&mut node.folders);
+        node.files
+            .sort_by(|a, b| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()));
+        node.note_count = node.files.len()
+            + node
+                .folders
+                .iter()
+                .map(|folder| folder.note_count)
+                .sum::<usize>();
+    }
+}
+
+fn build_file_tree(files: &[String]) -> FileTree {
+    let mut tree = FileTree::default();
+    for raw in files {
+        let path = normalize_slashes(raw);
+        let parts = path
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>();
+        if parts.is_empty() {
+            continue;
+        }
+        if parts.len() == 1 {
+            tree.root_files.push(path);
+            continue;
+        }
+        insert_file_into_folders(&mut tree.folders, &parts[..parts.len() - 1], &path, "");
+    }
+
+    tree.root_files
+        .sort_by(|a, b| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()));
+    finalize_folder_tree(&mut tree.folders);
+    tree
+}
+
+fn collect_sidebar_entries_from_folders(
+    nodes: &[FolderTreeNode],
+    expanded_folders: &HashSet<String>,
+    depth: usize,
+    out: &mut Vec<SidebarEntry>,
+) {
+    for folder in nodes {
+        let expanded = expanded_folders.contains(&folder.path);
+        out.push(SidebarEntry::Folder {
+            path: folder.path.clone(),
+            name: folder.name.clone(),
+            depth,
+            note_count: folder.note_count,
+            expanded,
+        });
+        if expanded {
+            collect_sidebar_entries_from_folders(&folder.folders, expanded_folders, depth + 1, out);
+            for file_path in &folder.files {
+                out.push(SidebarEntry::File {
+                    path: file_path.clone(),
+                    name: file_display_name(file_path),
+                    depth: depth + 1,
+                });
+            }
+        }
+    }
+}
+
+fn build_sidebar_entries(tree: &FileTree, expanded_folders: &HashSet<String>) -> Vec<SidebarEntry> {
+    let mut out = Vec::new();
+    collect_sidebar_entries_from_folders(&tree.folders, expanded_folders, 0, &mut out);
+    for file_path in &tree.root_files {
+        out.push(SidebarEntry::File {
+            path: file_path.clone(),
+            name: file_display_name(file_path),
+            depth: 0,
+        });
+    }
+    out
+}
+
+fn parent_folder_chain(file_path: &str) -> Vec<String> {
+    let normalized = normalize_slashes(file_path);
+    let mut parts = normalized
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    if parts.len() <= 1 {
+        return Vec::new();
+    }
+    parts.pop();
+
+    let mut out = Vec::new();
+    let mut current = String::new();
+    for part in parts {
+        if !current.is_empty() {
+            current.push('/');
+        }
+        current.push_str(part);
+        out.push(current.clone());
+    }
+    out
+}
+
+fn expand_parent_folders(expanded_folders: &mut HashSet<String>, file_path: &str) {
+    for folder in parent_folder_chain(file_path) {
+        expanded_folders.insert(folder);
+    }
+}
+
 fn normalize_pasted_text(text: &str) -> String {
     text.replace("\r\n", "\n")
         .replace('\r', "\n")
         .replace('\u{00A0}', " ")
+}
+
+fn escape_html_attr(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn normalize_slashes(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+fn collapse_path(path: &str) -> String {
+    let normalized = normalize_slashes(path);
+    let bytes = normalized.as_bytes();
+    let (prefix, rest) = if normalized.starts_with('/') {
+        (
+            "/".to_string(),
+            normalized.trim_start_matches('/').to_string(),
+        )
+    } else if bytes.len() >= 2 && bytes[1] == b':' {
+        let drive = normalized[..2].to_string();
+        let tail = normalized[2..].trim_start_matches('/').to_string();
+        (format!("{drive}/"), tail)
+    } else {
+        (String::new(), normalized)
+    };
+
+    let mut parts: Vec<&str> = Vec::new();
+    for segment in rest.split('/') {
+        if segment.is_empty() || segment == "." {
+            continue;
+        }
+        if segment == ".." {
+            if !parts.is_empty() {
+                parts.pop();
+            }
+            continue;
+        }
+        parts.push(segment);
+    }
+
+    let joined = parts.join("/");
+    if prefix.is_empty() {
+        joined
+    } else {
+        format!("{prefix}{joined}")
+    }
+}
+
+fn strip_wiki_target(raw: &str) -> String {
+    raw.trim()
+        .split('|')
+        .next()
+        .unwrap_or_default()
+        .split('#')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+fn strip_markdown_image_target(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let base = if trimmed.starts_with('<') {
+        trimmed
+            .trim_start_matches('<')
+            .split('>')
+            .next()
+            .unwrap_or_default()
+            .trim()
+    } else {
+        trimmed.split_whitespace().next().unwrap_or_default().trim()
+    };
+    base.split('#')
+        .next()
+        .unwrap_or_default()
+        .split('?')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+fn image_extension(path: &str) -> Option<String> {
+    let normalized = normalize_slashes(path);
+    let ext = Path::new(&normalized)
+        .extension()?
+        .to_str()?
+        .to_ascii_lowercase();
+    Some(ext)
+}
+
+fn is_supported_inline_image_path(path: &str) -> bool {
+    matches!(
+        image_extension(path).as_deref(),
+        Some(
+            "png"
+                | "jpg"
+                | "jpeg"
+                | "gif"
+                | "webp"
+                | "bmp"
+                | "svg"
+                | "tif"
+                | "tiff"
+                | "ico"
+                | "avif"
+                | "heic"
+                | "heif"
+        )
+    )
+}
+
+fn image_mime_for_path(path: &str) -> &'static str {
+    match image_extension(path).as_deref() {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("bmp") => "image/bmp",
+        Some("svg") => "image/svg+xml",
+        Some("tif") | Some("tiff") => "image/tiff",
+        Some("ico") => "image/x-icon",
+        Some("avif") => "image/avif",
+        Some("heic") => "image/heic",
+        Some("heif") => "image/heif",
+        _ => "application/octet-stream",
+    }
+}
+
+fn looks_like_external_url(target: &str) -> bool {
+    let t = target.trim().to_ascii_lowercase();
+    t.contains("://") || t.starts_with("data:")
+}
+
+fn current_note_dir(note_path: &str) -> String {
+    let normalized = normalize_slashes(note_path);
+    normalized
+        .rsplit_once('/')
+        .map(|(dir, _)| dir.to_string())
+        .unwrap_or_default()
+}
+
+fn is_path_within(base: &str, candidate: &str) -> bool {
+    let base_norm = collapse_path(base).trim_end_matches('/').to_string();
+    let candidate_norm = collapse_path(candidate);
+    if base_norm.is_empty() {
+        return false;
+    }
+    candidate_norm == base_norm || candidate_norm.starts_with(&format!("{base_norm}/"))
+}
+
+fn image_local_candidates(vault_path: &str, note_path: &str, target: &str) -> Vec<String> {
+    if target.is_empty() || !is_supported_inline_image_path(target) {
+        return Vec::new();
+    }
+    if looks_like_external_url(target) {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    let target_norm = normalize_slashes(target.trim());
+    let vault_norm = collapse_path(vault_path);
+
+    let is_windows_abs = {
+        let b = target_norm.as_bytes();
+        b.len() >= 2 && b[1] == b':'
+    };
+    if is_windows_abs {
+        // Keep auto-render strictly within the active vault.
+        return Vec::new();
+    }
+    if target_norm.starts_with('/') {
+        out.push(collapse_path(&format!(
+            "{vault_norm}/{}",
+            target_norm.trim_start_matches('/')
+        )));
+        return out;
+    }
+
+    let note_dir = current_note_dir(note_path);
+
+    if !note_dir.is_empty() {
+        out.push(collapse_path(&format!(
+            "{vault_norm}/{note_dir}/{target_norm}"
+        )));
+    }
+    out.push(collapse_path(&format!("{vault_norm}/{target_norm}")));
+    out.retain(|candidate| is_path_within(&vault_norm, candidate));
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn collect_image_targets_for_note(text: &str) -> Vec<(String, bool)> {
+    static RE_EMBED: OnceLock<Regex> = OnceLock::new();
+    static RE_MD_IMAGE: OnceLock<Regex> = OnceLock::new();
+
+    let re_embed = RE_EMBED.get_or_init(|| Regex::new(r"!\[\[([^\]\n]+)\]\]").unwrap());
+    let re_md_image =
+        RE_MD_IMAGE.get_or_init(|| Regex::new(r"!\[([^\]\n]*)\]\(([^)\n]+)\)").unwrap());
+
+    let mut out = Vec::new();
+    for cap in re_embed.captures_iter(text) {
+        let raw = cap.get(1).map(|m| m.as_str()).unwrap_or_default();
+        out.push((strip_wiki_target(raw), true));
+    }
+    for cap in re_md_image.captures_iter(text) {
+        let raw = cap.get(2).map(|m| m.as_str()).unwrap_or_default();
+        out.push((strip_markdown_image_target(raw), false));
+    }
+    out
+}
+
+fn resolve_image_preview_html(
+    ctx: Option<&ImageRenderContext>,
+    target: &str,
+    alt: Option<&str>,
+) -> Option<String> {
+    if target.is_empty() || !is_supported_inline_image_path(target) {
+        return None;
+    }
+
+    let src = if looks_like_external_url(target) {
+        target.to_string()
+    } else {
+        let ctx = ctx?;
+        let candidates = image_local_candidates(ctx.vault_path, ctx.current_file, target);
+        let path = candidates
+            .into_iter()
+            .find(|candidate| ctx.cache.contains_key(candidate))?;
+        ctx.cache.get(&path)?.to_string()
+    };
+
+    let alt = alt.unwrap_or_default();
+    Some(format!(
+        "<span class=\"md-inline-image-wrap\" contenteditable=\"false\"><img class=\"md-inline-image\" src=\"{}\" alt=\"{}\"/></span>",
+        escape_html_attr(&src),
+        escape_html_attr(alt)
+    ))
 }
 
 fn is_selection_navigation_key(key: &str) -> bool {
@@ -452,7 +930,11 @@ fn set_selection_byte_offsets(root: &HtmlElement, selection: Selection) {
     let _ = dom_selection.add_range(&range);
 }
 
-fn highlight_inline(text: &str, caret: Option<usize>) -> String {
+fn highlight_inline(
+    text: &str,
+    caret: Option<usize>,
+    image_ctx: Option<&ImageRenderContext>,
+) -> String {
     static RE_EMBED: OnceLock<Regex> = OnceLock::new();
     static RE_WIKI: OnceLock<Regex> = OnceLock::new();
     static RE_MD_LINK: OnceLock<Regex> = OnceLock::new();
@@ -495,6 +977,7 @@ fn highlight_inline(text: &str, caret: Option<usize>) -> String {
                 close_len: 1,
                 class: "hl-code",
                 hide_tokens: true,
+                preview_html: None,
             },
         );
     }
@@ -507,6 +990,8 @@ fn highlight_inline(text: &str, caret: Option<usize>) -> String {
     for cap in re_embed.captures_iter(text) {
         let m = cap.get(0).unwrap();
         let inner = cap.get(1).unwrap();
+        let target = strip_wiki_target(inner.as_str());
+        let preview_html = resolve_image_preview_html(image_ctx, &target, None);
         push_non_overlapping(
             &mut matches,
             InlineMatch {
@@ -518,6 +1003,7 @@ fn highlight_inline(text: &str, caret: Option<usize>) -> String {
                 close_len: 2,
                 class: "hl-embed",
                 hide_tokens: true,
+                preview_html,
             },
         );
     }
@@ -536,12 +1022,17 @@ fn highlight_inline(text: &str, caret: Option<usize>) -> String {
                 close_len: 2,
                 class: "hl-link",
                 hide_tokens: true,
+                preview_html: None,
             },
         );
     }
 
     for cap in re_md_image.captures_iter(text) {
         let m = cap.get(0).unwrap();
+        let alt = cap.get(1).map(|m| m.as_str()).unwrap_or_default();
+        let raw_target = cap.get(2).map(|m| m.as_str()).unwrap_or_default();
+        let target = strip_markdown_image_target(raw_target);
+        let preview_html = resolve_image_preview_html(image_ctx, &target, Some(alt));
         push_non_overlapping(
             &mut matches,
             InlineMatch {
@@ -553,6 +1044,7 @@ fn highlight_inline(text: &str, caret: Option<usize>) -> String {
                 close_len: 0,
                 class: "hl-embed",
                 hide_tokens: false,
+                preview_html,
             },
         );
     }
@@ -570,6 +1062,7 @@ fn highlight_inline(text: &str, caret: Option<usize>) -> String {
                 close_len: 0,
                 class: "hl-link",
                 hide_tokens: false,
+                preview_html: None,
             },
         );
     }
@@ -613,6 +1106,7 @@ fn highlight_inline(text: &str, caret: Option<usize>) -> String {
                 close_len: 1,
                 class: "hl-math-inline",
                 hide_tokens: true,
+                preview_html: None,
             },
         );
     }
@@ -629,6 +1123,7 @@ fn highlight_inline(text: &str, caret: Option<usize>) -> String {
                 close_len: 0,
                 class: "hl-footnote",
                 hide_tokens: false,
+                preview_html: None,
             },
         );
     }
@@ -645,6 +1140,7 @@ fn highlight_inline(text: &str, caret: Option<usize>) -> String {
                 close_len: 0,
                 class: "hl-footnote",
                 hide_tokens: false,
+                preview_html: None,
             },
         );
     }
@@ -661,6 +1157,7 @@ fn highlight_inline(text: &str, caret: Option<usize>) -> String {
                 close_len: 0,
                 class: "hl-tag",
                 hide_tokens: false,
+                preview_html: None,
             },
         );
     }
@@ -677,6 +1174,7 @@ fn highlight_inline(text: &str, caret: Option<usize>) -> String {
                 close_len: 0,
                 class: "hl-block-id",
                 hide_tokens: false,
+                preview_html: None,
             },
         );
     }
@@ -728,13 +1226,20 @@ fn highlight_inline(text: &str, caret: Option<usize>) -> String {
             out.push_str(&escape_html(&text[m.start..m.end]));
             out.push_str("</span>");
         }
+        if let Some(preview) = &m.preview_html {
+            out.push_str(preview);
+        }
         pos = m.end;
     }
     out.push_str(&escape_html(&text[pos..]));
     out
 }
 
-fn highlight_markdown(text: &str, caret: Option<usize>) -> String {
+fn highlight_markdown(
+    text: &str,
+    caret: Option<usize>,
+    image_ctx: Option<&ImageRenderContext>,
+) -> String {
     static RE_HEADING: OnceLock<Regex> = OnceLock::new();
     static RE_CALLOUT: OnceLock<Regex> = OnceLock::new();
     static RE_QUOTE: OnceLock<Regex> = OnceLock::new();
@@ -842,7 +1347,7 @@ fn highlight_markdown(text: &str, caret: Option<usize>) -> String {
         let caret_rel = caret
             .filter(|c| *c >= offset && *c < offset + line_len)
             .map(|c| c - offset);
-        let line_html = highlight_inline(line, caret_rel);
+        let line_html = highlight_inline(line, caret_rel, image_ctx);
 
         let wrapped = if re_callout.is_match(line_without_nl) {
             wrap_line("hl-callout", line_html)
@@ -883,6 +1388,24 @@ fn highlight_markdown(text: &str, caret: Option<usize>) -> String {
     }
 
     out
+}
+
+fn highlight_markdown_for_editor(
+    text: &str,
+    caret: Option<usize>,
+    vault_path: &str,
+    current_file: &str,
+    image_cache: &HashMap<String, String>,
+) -> String {
+    if vault_path.is_empty() || current_file.is_empty() {
+        return highlight_markdown(text, caret, None);
+    }
+    let ctx = ImageRenderContext {
+        vault_path,
+        current_file,
+        cache: image_cache,
+    };
+    highlight_markdown(text, caret, Some(&ctx))
 }
 
 fn extract_file_cache(text: &str) -> FileCache {
@@ -1090,6 +1613,7 @@ mod markdown_syntax_tests {
         let html = highlight_inline(
             "**bold** __bold2__ *it* _it2_ ~~gone~~ ==mark== ***both*** ___both2___",
             None,
+            None,
         );
         assert_has(&html, "hl-bold");
         assert_has(&html, "hl-italic");
@@ -1103,6 +1627,7 @@ mod markdown_syntax_tests {
         let html = highlight_inline(
             "[[Note]] ![[Asset.png]] [Label](Note.md) ![img](Img.png) #tag ^block-id",
             None,
+            None,
         );
         assert_has(&html, "hl-link");
         assert_has(&html, "hl-embed");
@@ -1115,6 +1640,7 @@ mod markdown_syntax_tests {
         let html = highlight_inline(
             "%%comment%% Ref[^1] inline ^[note] and $e^{i\\pi}+1=0$",
             None,
+            None,
         );
         assert_has(&html, "hl-comment");
         assert_has(&html, "hl-footnote");
@@ -1125,6 +1651,7 @@ mod markdown_syntax_tests {
     fn highlights_headings_h1_to_h6() {
         let html = highlight_markdown(
             "# h1\n## h2\n### h3\n#### h4\n##### h5\n###### h6\n".trim_end_matches('\n'),
+            None,
             None,
         );
         assert_has(&html, "hl-h1");
@@ -1140,6 +1667,7 @@ mod markdown_syntax_tests {
         let html = highlight_markdown(
             "> [!note] Title\n> quote\n- [ ] task\n1) one\n- item\n---\n",
             None,
+            None,
         );
         assert_has(&html, "hl-callout");
         assert_has(&html, "hl-quote");
@@ -1153,6 +1681,7 @@ mod markdown_syntax_tests {
         let html = highlight_markdown(
             "---\ntitle: Bedrock\n---\n| a | b |\n| --- | --- |\n```rust\nlet x = 1;\n```\n$$\na+b\n$$\n%%\ncomment block\n%%\n",
             None,
+            None,
         );
         assert_has(&html, "hl-frontmatter");
         assert_has(&html, "hl-table");
@@ -1164,7 +1693,7 @@ mod markdown_syntax_tests {
 
     #[test]
     fn highlights_footnote_definitions() {
-        let html = highlight_markdown("[^note]: footnote text\n", None);
+        let html = highlight_markdown("[^note]: footnote text\n", None, None);
         assert_has(&html, "hl-footnote-def");
     }
 
@@ -1181,7 +1710,7 @@ mod markdown_syntax_tests {
 
     #[test]
     fn inline_delimiters_respect_escaping() {
-        let html = highlight_inline(r"\*\*literal\*\* and **bold**", None);
+        let html = highlight_inline(r"\*\*literal\*\* and **bold**", None, None);
         assert_has(&html, "hl-bold");
         assert_has(&html, r"\*\*literal\*\*");
     }
@@ -1190,18 +1719,22 @@ mod markdown_syntax_tests {
 #[component]
 pub fn App() -> impl IntoView {
     let (vault_path, set_vault_path) = signal(String::new());
+    let (open_vaults, set_open_vaults) = signal(Vec::<String>::new());
     let (files, set_files) = signal(Vec::<String>::new());
     let (note_texts, set_note_texts) = signal(HashMap::<String, String>::new());
     let (metadata_cache, set_metadata_cache) = signal(MetadataCacheState::default());
 
     let (current_file, set_current_file) = signal(String::new());
-    let (_content, set_content) = signal(String::new());
+    let (content, set_content) = signal(String::new());
     let (editor_snapshot, set_editor_snapshot) = signal(EditorSnapshot::new(String::new()));
     let (parsed_html, set_parsed_html) = signal(String::new());
     let (_caret_pos, set_caret_pos) = signal(Option::<usize>::None);
     let editor_ref = NodeRef::<html::Div>::new();
     let (is_composing, set_is_composing) = signal(false);
     let (composition_dirty, set_composition_dirty) = signal(false);
+    let (image_preview_cache, set_image_preview_cache) = signal(HashMap::<String, String>::new());
+    let (image_preview_loading, set_image_preview_loading) = signal(HashSet::<String>::new());
+    let (image_preview_failed, set_image_preview_failed) = signal(HashSet::<String>::new());
 
     let (plugin_css, set_plugin_css) = signal(String::new());
     let (settings, set_settings) = signal(AppSettings::default());
@@ -1209,6 +1742,7 @@ pub fn App() -> impl IntoView {
     let (save_timeout_id, set_save_timeout_id) = signal(Option::<i32>::None);
     let (save_status, set_save_status) = signal("Saved".to_string());
     let (show_markdown_syntax, set_show_markdown_syntax) = signal(false);
+    let (expanded_folders, set_expanded_folders) = signal(HashSet::<String>::new());
     let (selection_restore_ticket, set_selection_restore_ticket) = signal(0u64);
     let (selection_sync_ticket, set_selection_sync_ticket) = signal(0u64);
 
@@ -1231,8 +1765,41 @@ pub fn App() -> impl IntoView {
         .unwrap_or_default()
         .contains("settings=true");
 
+    let clear_active_vault_state = move || {
+        set_files.set(Vec::new());
+        set_note_texts.set(HashMap::new());
+        set_metadata_cache.set(MetadataCacheState::default());
+        set_current_file.set(String::new());
+        set_content.set(String::new());
+        set_parsed_html.set(String::new());
+        set_caret_pos.set(None);
+        set_editor_snapshot.set(EditorSnapshot::new(String::new()));
+        set_image_preview_cache.set(HashMap::new());
+        set_image_preview_loading.set(HashSet::new());
+        set_image_preview_failed.set(HashSet::new());
+        set_expanded_folders.set(HashSet::new());
+        set_plugin_css.set(String::new());
+    };
+
+    let register_open_vault = move |path: String| {
+        let normalized = collapse_path(&path);
+        if normalized.is_empty() {
+            return;
+        }
+        set_open_vaults.update(|vaults| {
+            if !vaults.iter().any(|p| collapse_path(p) == normalized) {
+                vaults.push(path.clone());
+            }
+        });
+    };
+
     let refresh_vault_snapshot = move |path: String, preferred_file: Option<String>| {
         spawn_local(async move {
+            set_image_preview_cache.set(HashMap::new());
+            set_image_preview_loading.set(HashSet::new());
+            set_image_preview_failed.set(HashSet::new());
+            set_expanded_folders.set(HashSet::new());
+
             let dir_args = serde_wasm_bindgen::to_value(&ReadDirArgs { path: &path }).unwrap();
             let dir_val = invoke("read_dir", dir_args).await;
             let dir_list =
@@ -1265,11 +1832,20 @@ pub fn App() -> impl IntoView {
                 })
                 .or_else(|| dir_list.first().cloned());
 
-            if let Some(path) = next_file {
-                let text = note_map.get(&path).cloned().unwrap_or_default();
-                set_current_file.set(path);
+            if let Some(selected_file) = next_file {
+                let text = note_map.get(&selected_file).cloned().unwrap_or_default();
+                set_current_file.set(selected_file.clone());
+                set_expanded_folders.update(|expanded| {
+                    expand_parent_folders(expanded, &selected_file);
+                });
                 set_content.set(text.clone());
-                set_parsed_html.set(highlight_markdown(&text, None));
+                set_parsed_html.set(highlight_markdown_for_editor(
+                    &text,
+                    None,
+                    &path,
+                    &selected_file,
+                    &image_preview_cache.get_untracked(),
+                ));
                 set_caret_pos.set(None);
                 set_editor_snapshot.set(EditorSnapshot::new(text));
             } else {
@@ -1282,31 +1858,191 @@ pub fn App() -> impl IntoView {
         });
     };
 
-    Effect::new(move |_| {
+    let load_vault_visual_state = move |path: String| {
+        if path.is_empty() {
+            set_plugin_css.set(String::new());
+            return;
+        }
         spawn_local(async move {
-            let path_val = invoke("init_vault", JsValue::NULL).await;
-            if let Some(path_str) = path_val.as_string() {
-                set_vault_path.set(path_str.clone());
-                refresh_vault_snapshot(path_str.clone(), None);
+            let vault_args =
+                serde_wasm_bindgen::to_value(&VaultPathArgs { vault_path: &path }).unwrap();
 
-                let vault_args = serde_wasm_bindgen::to_value(&VaultPathArgs {
-                    vault_path: &path_str,
-                })
-                .unwrap();
+            let css_val = invoke("load_plugins_css", vault_args.clone()).await;
+            if let Some(css_str) = css_val.as_string() {
+                set_plugin_css.set(css_str);
+            } else {
+                set_plugin_css.set(String::new());
+            }
 
-                let css_val = invoke("load_plugins_css", vault_args.clone()).await;
-                if let Some(css_str) = css_val.as_string() {
-                    set_plugin_css.set(css_str);
-                }
-
-                let s_val = invoke("load_settings", vault_args).await;
-                if let Some(s_str) = s_val.as_string() {
-                    if let Ok(s) = serde_json::from_str::<AppSettings>(&s_str) {
-                        set_settings.set(s);
-                    }
+            let s_val = invoke("load_settings", vault_args).await;
+            if let Some(s_str) = s_val.as_string() {
+                if let Ok(s) = serde_json::from_str::<AppSettings>(&s_str) {
+                    set_settings.set(s);
                 }
             }
         });
+    };
+
+    let persist_vault_session = move |open_list: Vec<String>, active: Option<String>| {
+        let set_open = set_open_vaults;
+        let set_active = set_vault_path;
+        spawn_local(async move {
+            let payload = Object::new();
+            let open_value = serde_wasm_bindgen::to_value(&open_list).unwrap_or(JsValue::NULL);
+            let active_value = active
+                .as_ref()
+                .map(|value| JsValue::from_str(value))
+                .unwrap_or(JsValue::NULL);
+
+            let _ = Reflect::set(&payload, &JsValue::from_str("open_vaults"), &open_value);
+            let _ = Reflect::set(&payload, &JsValue::from_str("openVaults"), &open_value);
+            let _ = Reflect::set(&payload, &JsValue::from_str("active_vault"), &active_value);
+            let _ = Reflect::set(&payload, &JsValue::from_str("activeVault"), &active_value);
+
+            let result = invoke("save_vault_session", payload.into()).await;
+            if let Ok(normalized) = serde_wasm_bindgen::from_value::<VaultSessionState>(result) {
+                set_open.set(normalized.open_vaults.clone());
+                if let Some(active_path) = normalized.active_vault {
+                    set_active.set(active_path);
+                }
+            }
+        });
+    };
+
+    let activate_vault = move |path: String, preferred_file: Option<String>| {
+        if path.is_empty() {
+            return;
+        }
+        set_vault_path.set(path.clone());
+        register_open_vault(path.clone());
+        let open_now = open_vaults.get_untracked();
+        persist_vault_session(open_now, Some(path.clone()));
+        refresh_vault_snapshot(path.clone(), preferred_file);
+        load_vault_visual_state(path);
+    };
+
+    Effect::new(move |_| {
+        spawn_local(async move {
+            let default_path = invoke("init_vault", JsValue::NULL).await.as_string();
+
+            let session_val = invoke("load_vault_session", JsValue::NULL).await;
+            let mut session = serde_wasm_bindgen::from_value::<VaultSessionState>(session_val)
+                .unwrap_or_default();
+
+            let fallback = default_path.unwrap_or_default();
+            if session.open_vaults.is_empty() && !fallback.is_empty() {
+                session.open_vaults.push(fallback.clone());
+            }
+
+            let mut active = session
+                .active_vault
+                .clone()
+                .filter(|p| !p.trim().is_empty())
+                .or_else(|| session.open_vaults.first().cloned());
+
+            if active.is_none() && !fallback.is_empty() {
+                active = Some(fallback.clone());
+            }
+
+            if let Some(active_path) = active.clone() {
+                if !session
+                    .open_vaults
+                    .iter()
+                    .any(|p| collapse_path(p) == collapse_path(&active_path))
+                {
+                    session.open_vaults.push(active_path);
+                }
+            }
+
+            set_open_vaults.set(session.open_vaults.clone());
+
+            if let Some(path) = active.clone() {
+                activate_vault(path, None);
+            } else {
+                set_vault_path.set(String::new());
+                clear_active_vault_state();
+                set_plugin_css.set(String::new());
+            }
+            persist_vault_session(session.open_vaults.clone(), active.clone());
+        });
+    });
+
+    Effect::new(move |_| {
+        let v_path = vault_path.get();
+        let file = current_file.get();
+        let text = content.get();
+        if v_path.is_empty() || file.is_empty() || text.is_empty() {
+            return;
+        }
+
+        let mut pending_paths = Vec::new();
+        let cache = image_preview_cache.get_untracked();
+        let loading = image_preview_loading.get_untracked();
+        let failed = image_preview_failed.get_untracked();
+
+        for (target, _is_wiki_embed) in collect_image_targets_for_note(&text) {
+            if target.is_empty()
+                || looks_like_external_url(&target)
+                || !is_supported_inline_image_path(&target)
+            {
+                continue;
+            }
+            let candidates = image_local_candidates(&v_path, &file, &target);
+            if candidates
+                .iter()
+                .any(|candidate| cache.contains_key(candidate))
+            {
+                continue;
+            }
+            for candidate in candidates {
+                if !loading.contains(&candidate) && !failed.contains(&candidate) {
+                    pending_paths.push(candidate);
+                }
+            }
+        }
+
+        pending_paths.sort();
+        pending_paths.dedup();
+        if pending_paths.is_empty() {
+            return;
+        }
+
+        set_image_preview_loading.update(|loading_set| {
+            for path in &pending_paths {
+                loading_set.insert(path.clone());
+            }
+        });
+
+        for image_path in pending_paths {
+            let set_cache = set_image_preview_cache;
+            let set_loading = set_image_preview_loading;
+            let set_failed = set_image_preview_failed;
+            spawn_local(async move {
+                let args =
+                    serde_wasm_bindgen::to_value(&ReadFileArgs { path: &image_path }).unwrap();
+                let value = invoke("read_file_base64", args).await;
+                if let Some(encoded) = value.as_string() {
+                    let src = format!(
+                        "data:{};base64,{}",
+                        image_mime_for_path(&image_path),
+                        encoded
+                    );
+                    set_cache.update(|cache| {
+                        cache.insert(image_path.clone(), src);
+                    });
+                    set_failed.update(|failed| {
+                        failed.remove(&image_path);
+                    });
+                } else {
+                    set_failed.update(|failed| {
+                        failed.insert(image_path.clone());
+                    });
+                }
+                set_loading.update(|loading| {
+                    loading.remove(&image_path);
+                });
+            });
+        }
     });
 
     let schedule_disk_write = move |filename: String, new_text: String| {
@@ -1374,6 +2110,30 @@ pub fn App() -> impl IntoView {
         }
     };
 
+    Effect::new(move |_| {
+        let cache = image_preview_cache.get();
+        if cache.is_empty() || is_composing.get_untracked() {
+            return;
+        }
+
+        let text = content.get_untracked();
+        let file = current_file.get_untracked();
+        let v_path = vault_path.get_untracked();
+        if text.is_empty() || file.is_empty() || v_path.is_empty() {
+            return;
+        }
+
+        let selection = editor_snapshot.get_untracked().selection.clamp(text.len());
+        set_parsed_html.set(highlight_markdown_for_editor(
+            &text,
+            Some(selection.start),
+            &v_path,
+            &file,
+            &cache,
+        ));
+        schedule_selection_restore(selection);
+    });
+
     let apply_editor_update = move |new_text: String, sel_start: usize, sel_end: usize| {
         set_composition_dirty.set(false);
         let mut snapshot = editor_snapshot.get_untracked();
@@ -1385,7 +2145,13 @@ pub fn App() -> impl IntoView {
 
         set_content.set(final_text.clone());
         set_caret_pos.set(Some(final_selection.start));
-        set_parsed_html.set(highlight_markdown(&final_text, Some(final_selection.start)));
+        set_parsed_html.set(highlight_markdown_for_editor(
+            &final_text,
+            Some(final_selection.start),
+            &vault_path.get_untracked(),
+            &current_file.get_untracked(),
+            &image_preview_cache.get_untracked(),
+        ));
 
         let file = current_file.get_untracked();
         if !file.is_empty() {
@@ -1413,9 +2179,18 @@ pub fn App() -> impl IntoView {
 
     let select_file = move |filename: String| {
         if let Some(text) = note_texts.get_untracked().get(&filename).cloned() {
-            set_current_file.set(filename);
+            set_current_file.set(filename.clone());
+            set_expanded_folders.update(|expanded| {
+                expand_parent_folders(expanded, &filename);
+            });
             set_content.set(text.clone());
-            set_parsed_html.set(highlight_markdown(&text, None));
+            set_parsed_html.set(highlight_markdown_for_editor(
+                &text,
+                None,
+                &vault_path.get_untracked(),
+                &filename,
+                &image_preview_cache.get_untracked(),
+            ));
             set_caret_pos.set(None);
             set_editor_snapshot.set(EditorSnapshot::new(text));
             return;
@@ -1431,8 +2206,17 @@ pub fn App() -> impl IntoView {
             let text_val = invoke("read_file", args).await;
             if let Some(text) = text_val.as_string() {
                 set_current_file.set(filename.clone());
+                set_expanded_folders.update(|expanded| {
+                    expand_parent_folders(expanded, &filename);
+                });
                 set_content.set(text.clone());
-                set_parsed_html.set(highlight_markdown(&text, None));
+                set_parsed_html.set(highlight_markdown_for_editor(
+                    &text,
+                    None,
+                    &v_path,
+                    &filename,
+                    &image_preview_cache.get_untracked(),
+                ));
                 set_caret_pos.set(None);
                 set_editor_snapshot.set(EditorSnapshot::new(text.clone()));
 
@@ -1466,7 +2250,13 @@ pub fn App() -> impl IntoView {
                 set_editor_snapshot.set(snapshot);
                 set_caret_pos.set(Some(selection.start));
                 if !is_composing.get_untracked() {
-                    set_parsed_html.set(highlight_markdown(&text, Some(selection.start)));
+                    set_parsed_html.set(highlight_markdown_for_editor(
+                        &text,
+                        Some(selection.start),
+                        &vault_path.get_untracked(),
+                        &current_file.get_untracked(),
+                        &image_preview_cache.get_untracked(),
+                    ));
                     schedule_selection_restore(selection);
                 }
             }
@@ -1877,6 +2667,91 @@ pub fn App() -> impl IntoView {
         }
     };
 
+    let import_from_obsidian_vault = move || {
+        spawn_local(async move {
+            let result = invoke("import_obsidian_vault_with_picker", JsValue::NULL).await;
+            let Ok(report) = serde_wasm_bindgen::from_value::<VaultImportReport>(result) else {
+                let _ = window()
+                    .alert_with_message("Import failed: backend returned an invalid response.");
+                return;
+            };
+
+            let mut summary = report.message.clone();
+            if report.success {
+                if let Some(source) = report.source_vault.as_ref() {
+                    summary.push_str(&format!("\nSource: {source}"));
+                }
+                if let Some(destination) = report.destination_vault.as_ref() {
+                    summary.push_str(&format!("\nDestination: {destination}"));
+                }
+                summary.push_str(&format!(
+                    "\nNotes: scanned {} imported {} | Images: scanned {} imported {} | Renamed: {}",
+                    report.scanned_notes,
+                    report.imported_notes,
+                    report.scanned_images,
+                    report.imported_images,
+                    report.renamed_notes
+                ));
+            } else if report.cancelled {
+                summary = "Import cancelled by user.".to_string();
+            }
+            let _ = window().alert_with_message(&summary);
+
+            if report.success {
+                if let Some(destination) = report.destination_vault {
+                    activate_vault(destination, None);
+                }
+            }
+        });
+    };
+
+    let open_bedrock_vault = move || {
+        spawn_local(async move {
+            let result = invoke("pick_bedrock_vault", JsValue::NULL).await;
+            let picked = serde_wasm_bindgen::from_value::<Option<String>>(result)
+                .ok()
+                .flatten();
+            let Some(path) = picked else {
+                return;
+            };
+            activate_vault(path, None);
+        });
+    };
+
+    let switch_to_vault = move |path: String| {
+        if path.is_empty() {
+            return;
+        }
+        let current = collapse_path(&vault_path.get_untracked());
+        let next = collapse_path(&path);
+        if current == next {
+            return;
+        }
+        activate_vault(path, None);
+    };
+
+    let close_current_vault = move || {
+        let current = vault_path.get_untracked();
+        if current.is_empty() {
+            return;
+        }
+
+        let current_norm = collapse_path(&current);
+        let mut next_vault = None::<String>;
+        set_open_vaults.update(|vaults| {
+            vaults.retain(|p| collapse_path(p) != current_norm);
+            next_vault = vaults.last().cloned();
+        });
+
+        if let Some(path) = next_vault {
+            activate_vault(path, None);
+        } else {
+            set_vault_path.set(String::new());
+            clear_active_vault_state();
+            persist_vault_session(Vec::new(), None);
+        }
+    };
+
     let dynamic_style = move || {
         let s = settings.get();
         format!(
@@ -1975,62 +2850,196 @@ pub fn App() -> impl IntoView {
         } else {
             view! {
                 <nav class="sidebar" style="width: var(--sidebar-width); border-right: 1px solid var(--border-color); display: flex; flex-direction: column; background: var(--bg-secondary); transition: all 0.3s ease;">
-                    <div class="sidebar-header" style="height: var(--topbar-height); display: flex; align-items: center; justify-content: space-between; padding: 0 1rem; border-bottom: 1px solid var(--border-color); font-weight: 600; color: var(--accent-color);">
-                        <span>"Bedrock"</span>
-                        <div style="display: flex; gap: 0.5rem; align-items: center;">
-                            <button
-                                on:click=move |_| create_new_note()
-                                style="background: transparent; border: none; font-size: 1.2rem; cursor: pointer; color: var(--text-muted);"
-                                title="New note"
+                    <div class="sidebar-header" style="display: flex; flex-direction: column; gap: 0.5rem; padding: 0.65rem 0.75rem; border-bottom: 1px solid var(--border-color);">
+                        <div style="display: flex; align-items: center; justify-content: space-between; gap: 0.5rem;">
+                            <span style="font-weight: 700; color: var(--accent-color);">"Bedrock"</span>
+                            <div style="display: flex; gap: 0.3rem; align-items: center;">
+                                <button
+                                    on:click=move |_| open_bedrock_vault()
+                                    style="background: transparent; border: none; font-size: 0.95rem; cursor: pointer; color: var(--text-muted);"
+                                    title="Open or add a vault"
+                                >
+                                    "🗂"
+                                </button>
+                                <button
+                                    on:click=move |_| close_current_vault()
+                                    style="background: transparent; border: none; font-size: 0.95rem; cursor: pointer; color: var(--text-muted);"
+                                    title="Close current vault"
+                                >
+                                    "✕"
+                                </button>
+                                <button
+                                    on:click=move |_| create_new_note()
+                                    style="background: transparent; border: none; font-size: 1.1rem; cursor: pointer; color: var(--text-muted);"
+                                    title="New note"
+                                >
+                                    "+"
+                                </button>
+                                <button
+                                    on:click=move |_| import_from_obsidian_vault()
+                                    style="background: transparent; border: none; font-size: 1rem; cursor: pointer; color: var(--text-muted);"
+                                    title="Import from Obsidian vault"
+                                >
+                                    "⇪"
+                                </button>
+                                <button
+                                    on:click=move |_| {
+                                        spawn_local(async move {
+                                            invoke("open_settings_window", JsValue::NULL).await;
+                                        });
+                                    }
+                                    style="background: transparent; border: none; font-size: 1.1rem; cursor: pointer; color: var(--text-muted);"
+                                    title="Settings"
+                                >
+                                    "⚙"
+                                </button>
+                            </div>
+                        </div>
+                        <div style="display: flex; flex-direction: column; gap: 0.25rem;">
+                            <select
+                                style="width: 100%; font-size: 0.78rem; padding: 0.2rem 0.35rem; border-radius: var(--radius-sm); border: 1px solid var(--border-color); background: var(--bg-primary); color: var(--text-primary);"
+                                prop:value=move || vault_path.get()
+                                on:change=move |e| switch_to_vault(event_target_value(&e))
                             >
-                                "+"
-                            </button>
-                            <button
-                                on:click=move |_| {
-                                    spawn_local(async move {
-                                        invoke("open_settings_window", JsValue::NULL).await;
-                                    });
-                                }
-                                style="background: transparent; border: none; font-size: 1.2rem; cursor: pointer; color: var(--text-muted);"
-                                title="Settings"
+                                {move || {
+                                    let vaults = open_vaults.get();
+                                    if vaults.is_empty() {
+                                        vec![view! { <option value=String::new()>{"No open vaults".to_string()}</option> }]
+                                    } else {
+                                        vaults
+                                            .into_iter()
+                                            .map(|path| {
+                                                let label = vault_display_name(&path);
+                                                view! { <option value=path.clone()>{label}</option> }
+                                            })
+                                            .collect::<Vec<_>>()
+                                    }
+                                }}
+                            </select>
+                            <span
+                                style="font-size: 0.72rem; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;"
+                                title=move || vault_path.get()
                             >
-                                "⚙"
-                            </button>
+                                {move || {
+                                    let path = vault_path.get();
+                                    if path.is_empty() {
+                                        "No active vault".to_string()
+                                    } else {
+                                        format!("Active: {}", vault_display_name(&path))
+                                    }
+                                }}
+                            </span>
                         </div>
                     </div>
                     <div class="file-list" style="flex: 1; overflow-y: auto; padding: 0.75rem 0.5rem;">
-                        {move || files.get().into_iter().map(|f| {
-                            let filename = f.clone();
-                            let f_clone = f.clone();
-                            let is_active = move || current_file.get() == f_clone;
+                        {move || {
+                            let files_in_vault = files.get();
+                            if files_in_vault.is_empty() {
+                                let msg = if vault_path.get().is_empty() {
+                                    "Open a Bedrock vault to see notes."
+                                } else {
+                                    "No markdown notes in this vault."
+                                };
+                                return view! {
+                                    <div style="padding: 0.5rem 0.75rem; font-size: 0.82rem; color: var(--text-muted);">
+                                        {msg}
+                                    </div>
+                                }.into_any();
+                            }
+
+                            let tree = build_file_tree(&files_in_vault);
+                            let rows = build_sidebar_entries(&tree, &expanded_folders.get());
 
                             view! {
-                                <div
-                                    class="file-item"
-                                    style=move || format!("padding: 0.5rem 0.75rem; cursor: pointer; border-radius: var(--radius-md); margin-bottom: 4px; font-size: 0.9rem; transition: background 0.2s, color 0.2s; {}", if is_active() { "background: var(--accent-color); color: white;" } else { "color: var(--text-secondary);" })
-                                    on:click=move |_| select_file(filename.clone())
-                                >
-                                    {f}
-                                </div>
-                            }
-                        }).collect::<Vec<_>>()}
+                                <>
+                                    {rows.into_iter().map(|row| {
+                                        match row {
+                                            SidebarEntry::Folder { path, name, depth, note_count, expanded } => {
+                                                let toggle_path = path.clone();
+                                                let indent = 0.45 + (depth as f32 * 0.95);
+                                                let chevron = if expanded { "▾" } else { "▸" };
+                                                let row_bg = if expanded {
+                                                    "background: color-mix(in srgb, var(--accent-color) 11%, transparent);"
+                                                } else {
+                                                    ""
+                                                };
+
+                                                view! {
+                                                    <div
+                                                        class="folder-item"
+                                                        style=format!(
+                                                            "display: flex; align-items: center; gap: 0.4rem; padding: 0.34rem 0.5rem 0.34rem {indent}rem; cursor: pointer; border-radius: var(--radius-md); margin-bottom: 2px; font-size: 0.82rem; color: var(--text-secondary); transition: background 0.15s ease; {row_bg}"
+                                                        )
+                                                        on:click=move |_| {
+                                                            set_expanded_folders.update(|expanded_set| {
+                                                                if expanded_set.contains(&toggle_path) {
+                                                                    expanded_set.remove(&toggle_path);
+                                                                } else {
+                                                                    expanded_set.insert(toggle_path.clone());
+                                                                }
+                                                            });
+                                                        }
+                                                        title=path
+                                                    >
+                                                        <span style="width: 0.8rem; text-align: center; color: var(--text-muted);">{chevron}</span>
+                                                        <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{name}</span>
+                                                        <span style="margin-left: auto; font-size: 0.72rem; color: var(--text-muted);">{note_count.to_string()}</span>
+                                                    </div>
+                                                }.into_any()
+                                            }
+                                            SidebarEntry::File { path, name, depth } => {
+                                                let filename = path.clone();
+                                                let active_path = path.clone();
+                                                let is_active = move || current_file.get() == active_path;
+                                                let indent = 1.5 + (depth as f32 * 0.95);
+
+                                                view! {
+                                                    <div
+                                                        class="file-item"
+                                                        style=move || format!(
+                                                            "padding: 0.38rem 0.65rem 0.38rem {indent}rem; cursor: pointer; border-radius: var(--radius-md); margin-bottom: 2px; font-size: 0.84rem; transition: background 0.2s, color 0.2s; {}",
+                                                            if is_active() { "background: var(--accent-color); color: white;" } else { "color: var(--text-secondary);" }
+                                                        )
+                                                        on:click=move |_| select_file(filename.clone())
+                                                        title=path
+                                                    >
+                                                        {name}
+                                                    </div>
+                                                }.into_any()
+                                            }
+                                        }
+                                    }).collect::<Vec<_>>()}
+                                </>
+                            }.into_any()
+                        }}
                     </div>
                 </nav>
                 <section class="editor-pane" style="flex: 1; display: flex; flex-direction: column; background: var(--bg-primary); min-width: 0;">
                     {move || if current_file.get().is_empty() {
+                        let has_vault = !vault_path.get().is_empty();
+                        let message = if has_vault {
+                            "Select a note from the sidebar to start editing."
+                        } else {
+                            "Open a Bedrock vault to begin."
+                        };
                         view! {
                             <div style="flex: 1; display: flex; align-items: center; justify-content: center; color: var(--text-muted);">
-                                "Select a note from the sidebar to start editing."
+                                {message}
                             </div>
                         }.into_any()
                     } else {
                         view! {
                             <header class="topbar" style="height: var(--topbar-height); border-bottom: 1px solid var(--border-color); display: flex; align-items: center; justify-content: space-between; padding: 0 1.5rem; color: var(--text-muted); font-size: 0.9rem; gap: 1rem;">
                                 <div style="display: flex; align-items: center; gap: 0.75rem; min-width: 0;">
-                                    <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{move || current_file.get()}</span>
+                                    <div style="display: flex; flex-direction: column; min-width: 0; gap: 0.1rem;">
+                                        <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{move || current_file.get()}</span>
+                                        <span style="font-size: 0.72rem; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title=move || vault_path.get()>{move || format!("Vault: {}", vault_display_name(&vault_path.get()))}</span>
+                                    </div>
                                     <span style="font-size: 0.8rem; color: var(--text-muted);">{move || save_status.get()}</span>
                                 </div>
                                 <div style="display: flex; gap: 0.5rem;">
+                                    <button style="padding: 0.25rem 0.6rem; font-size: 0.75rem;" on:click=move |_| open_bedrock_vault()>"Open Vault"</button>
+                                    <button style="padding: 0.25rem 0.6rem; font-size: 0.75rem;" on:click=move |_| import_from_obsidian_vault()>"Import Obsidian"</button>
                                     <button style="padding: 0.25rem 0.6rem; font-size: 0.75rem;" on:click=move |_| rename_current_note()>"Rename"</button>
                                 </div>
                             </header>

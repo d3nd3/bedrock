@@ -186,6 +186,29 @@ a:hover {
   pointer-events: auto;
 }
 
+.md-inline-image-wrap {
+  display: inline-flex;
+  vertical-align: middle;
+  margin-left: 0.35em;
+  max-width: min(100%, 36rem);
+  user-select: none;
+  pointer-events: none;
+}
+
+.md-inline-image {
+  display: block;
+  max-width: min(100%, 32rem);
+  max-height: 20rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid color-mix(in srgb, var(--border-color) 85%, transparent);
+  background: color-mix(in srgb, var(--bg-secondary) 65%, transparent);
+  box-shadow: var(--shadow-sm);
+}
+
+.editor-surface.show-syntax .md-inline-image-wrap {
+  display: none;
+}
+
 /* Markdown Highlight Styles for In-Place Editor */
 .hl-h1,
 .hl-h2,
