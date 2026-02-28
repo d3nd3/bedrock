@@ -774,6 +774,35 @@ fn load_settings(vault_path: &str) -> Result<String, String> {
     fs::read_to_string(settings_path).or_else(|_| Ok("{}".to_string()))
 }
 
+fn recent_notes_path(vault_path: &str) -> PathBuf {
+    Path::new(vault_path).join(".bedrock").join("recent.json")
+}
+
+#[derive(serde::Deserialize)]
+struct SaveRecentNotesPayload {
+    vault_path: String,
+    paths: Vec<String>,
+}
+
+#[tauri::command]
+fn read_recent_notes(vault_path: &str) -> Vec<String> {
+    let path = recent_notes_path(vault_path);
+    let raw = match fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default()
+}
+
+#[tauri::command]
+fn save_recent_notes(payload: SaveRecentNotesPayload) -> Result<(), String> {
+    let dir = Path::new(&payload.vault_path).join(".bedrock");
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join("recent.json");
+    let json = serde_json::to_string(&payload.paths).map_err(|e| e.to_string())?;
+    fs::write(path, json).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn import_obsidian_vault_with_picker() -> VaultImportReport {
     #[cfg(any(target_os = "android", target_os = "ios"))]
@@ -983,7 +1012,9 @@ pub fn run() {
             import_obsidian_vault_with_picker,
             pick_bedrock_vault,
             load_vault_session,
-            save_vault_session
+            save_vault_session,
+            read_recent_notes,
+            save_recent_notes,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")

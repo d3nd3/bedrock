@@ -54,6 +54,11 @@ struct RenameNoteArgs<'a> {
     old_path: &'a str,
     new_path: &'a str,
 }
+#[derive(Serialize)]
+struct SaveRecentNotesArgs<'a> {
+    vault_path: &'a str,
+    paths: &'a [String],
+}
 
 #[derive(Deserialize, Clone, Debug)]
 struct VaultNote {
@@ -190,6 +195,7 @@ struct InlineMatch {
     class: &'static str,
     hide_tokens: bool,
     preview_html: Option<String>,
+    hide_entire_unless_caret: bool,
 }
 
 struct ImageRenderContext<'a> {
@@ -262,6 +268,7 @@ fn collect_delimited_matches(
                 class,
                 hide_tokens,
                 preview_html: None,
+                hide_entire_unless_caret: false,
             });
         } else {
             pending_open = Some(token);
@@ -281,6 +288,7 @@ fn collect_delimited_matches(
             class,
             hide_tokens,
             preview_html: None,
+            hide_entire_unless_caret: false,
         });
     }
 
@@ -1026,6 +1034,7 @@ fn highlight_inline(
                 class: "hl-code",
                 hide_tokens: true,
                 preview_html: None,
+                hide_entire_unless_caret: false,
             },
         );
     }
@@ -1052,6 +1061,7 @@ fn highlight_inline(
                 class: "hl-embed",
                 hide_tokens: true,
                 preview_html,
+                hide_entire_unless_caret: false,
             },
         );
     }
@@ -1071,6 +1081,7 @@ fn highlight_inline(
                 class: "hl-link",
                 hide_tokens: true,
                 preview_html: None,
+                hide_entire_unless_caret: false,
             },
         );
     }
@@ -1093,6 +1104,7 @@ fn highlight_inline(
                 class: "hl-embed",
                 hide_tokens: false,
                 preview_html,
+                hide_entire_unless_caret: true,
             },
         );
     }
@@ -1111,6 +1123,7 @@ fn highlight_inline(
                 class: "hl-link",
                 hide_tokens: false,
                 preview_html: None,
+                hide_entire_unless_caret: false,
             },
         );
     }
@@ -1155,6 +1168,7 @@ fn highlight_inline(
                 class: "hl-math-inline",
                 hide_tokens: true,
                 preview_html: None,
+                hide_entire_unless_caret: false,
             },
         );
     }
@@ -1172,6 +1186,7 @@ fn highlight_inline(
                 class: "hl-footnote",
                 hide_tokens: false,
                 preview_html: None,
+                hide_entire_unless_caret: false,
             },
         );
     }
@@ -1189,6 +1204,7 @@ fn highlight_inline(
                 class: "hl-footnote",
                 hide_tokens: false,
                 preview_html: None,
+                hide_entire_unless_caret: false,
             },
         );
     }
@@ -1206,6 +1222,7 @@ fn highlight_inline(
                 class: "hl-tag",
                 hide_tokens: false,
                 preview_html: None,
+                hide_entire_unless_caret: false,
             },
         );
     }
@@ -1223,6 +1240,7 @@ fn highlight_inline(
                 class: "hl-block-id",
                 hide_tokens: false,
                 preview_html: None,
+                hide_entire_unless_caret: false,
             },
         );
     }
@@ -1243,7 +1261,14 @@ fn highlight_inline(
         out.push_str(&escape_html(&text[pos..m.start]));
         let caret_inside = caret.map(|c| c >= m.start && c <= m.end).unwrap_or(false);
 
-        if caret_inside && m.hide_tokens {
+        if m.hide_entire_unless_caret && !caret_inside {
+            out.push_str("<span class=\"md-token md-token-hidden\">");
+            out.push_str(&escape_html(&text[m.start..m.end]));
+            out.push_str("</span>");
+            if let Some(preview) = &m.preview_html {
+                out.push_str(preview);
+            }
+        } else if caret_inside && m.hide_tokens {
             // Keep live formatting active while caret is inside the markdown span,
             // but reveal the wrapper tokens for accurate editing context.
             out.push_str("<span class=\"md-token md-token-visible\">");
@@ -1275,7 +1300,9 @@ fn highlight_inline(
             out.push_str("</span>");
         }
         if let Some(preview) = &m.preview_html {
-            out.push_str(preview);
+            if !(m.hide_entire_unless_caret && !caret_inside) {
+                out.push_str(preview);
+            }
         }
         pos = m.end;
     }
@@ -1793,6 +1820,8 @@ pub fn App() -> impl IntoView {
     let (show_markdown_syntax, set_show_markdown_syntax) = signal(false);
     let (expanded_folders, set_expanded_folders) = signal(HashSet::<String>::new());
     let (sidebar_context_menu, set_sidebar_context_menu) = signal(Option::<SidebarContextMenu>::None);
+    let (sidebar_tab, set_sidebar_tab) = signal("files".to_string());
+    let (recent_notes, set_recent_notes) = signal(Vec::<String>::new());
     let (selection_restore_ticket, set_selection_restore_ticket) = signal(0u64);
     let (selection_sync_ticket, set_selection_sync_ticket) = signal(0u64);
 
@@ -1829,7 +1858,31 @@ pub fn App() -> impl IntoView {
         set_image_preview_loading.set(HashSet::new());
         set_image_preview_failed.set(HashSet::new());
         set_expanded_folders.set(HashSet::new());
+        set_recent_notes.set(Vec::new());
         set_plugin_css.set(String::new());
+    };
+
+    let push_to_recent_notes = move |path: String| {
+        if path.is_empty() {
+            return;
+        }
+        let v_path = vault_path.get_untracked();
+        if v_path.is_empty() {
+            return;
+        }
+        set_recent_notes.update(|list| {
+            list.retain(|p| p != &path);
+            list.insert(0, path.clone());
+            if list.len() > 50 {
+                list.truncate(50);
+            }
+        });
+        let list = recent_notes.get_untracked();
+        let v = v_path.clone();
+        spawn_local(async move {
+            let args = serde_wasm_bindgen::to_value(&SaveRecentNotesArgs { vault_path: &v, paths: &list }).unwrap();
+            let _ = invoke("save_recent_notes", args).await;
+        });
     };
 
     let refresh_vault_snapshot = move |path: String, preferred_file: Option<String>| {
@@ -1842,8 +1895,16 @@ pub fn App() -> impl IntoView {
             let dir_val = invoke("read_dir", dir_args).await;
             let dir_result =
                 serde_wasm_bindgen::from_value::<ReadDirResult>(dir_val).unwrap_or_else(|_| ReadDirResult { notes: Vec::new(), empty_dirs: Vec::new() });
+            if path != vault_path.get_untracked() {
+                return;
+            }
             set_files.set(dir_result.notes.clone());
             set_empty_dirs.set(dir_result.empty_dirs.clone());
+
+            let recent_val = invoke("read_recent_notes", serde_wasm_bindgen::to_value(&path).unwrap()).await;
+            if path == vault_path.get_untracked() {
+                set_recent_notes.set(serde_wasm_bindgen::from_value::<Vec<String>>(recent_val).unwrap_or_default());
+            }
 
             let vault_args =
                 serde_wasm_bindgen::to_value(&VaultPathArgs { vault_path: &path }).unwrap();
@@ -1875,6 +1936,7 @@ pub fn App() -> impl IntoView {
             if let Some(selected_file) = next_file {
                 let text = note_map.get(&selected_file).cloned().unwrap_or_default();
                 set_current_file.set(selected_file.clone());
+                push_to_recent_notes(selected_file.clone());
                 set_expanded_folders.update(|expanded| {
                     expand_parent_folders(expanded, &selected_file);
                 });
@@ -2230,6 +2292,7 @@ pub fn App() -> impl IntoView {
     let select_file = move |filename: String| {
         if let Some(text) = note_texts.get_untracked().get(&filename).cloned() {
             set_current_file.set(filename.clone());
+            push_to_recent_notes(filename.clone());
             set_expanded_folders.update(|expanded| {
                 expand_parent_folders(expanded, &filename);
             });
@@ -2256,6 +2319,7 @@ pub fn App() -> impl IntoView {
             let text_val = invoke("read_file", args).await;
             if let Some(text) = text_val.as_string() {
                 set_current_file.set(filename.clone());
+                push_to_recent_notes(filename.clone());
                 set_expanded_folders.update(|expanded| {
                     expand_parent_folders(expanded, &filename);
                 });
@@ -3076,8 +3140,64 @@ pub fn App() -> impl IntoView {
                             </span>
                         </div>
                     </div>
+                    <div style="display: flex; gap: 0; border-bottom: 1px solid var(--border-color); padding: 0 0.5rem;">
+                        <button
+                            style=move || format!("flex: 1; padding: 0.4rem 0.5rem; font-size: 0.8rem; border: none; border-radius: 0; background: transparent; color: {}; border-bottom: 2px solid {};",
+                                if sidebar_tab.get() == "files" { "var(--accent-color)" } else { "var(--text-muted)" },
+                                if sidebar_tab.get() == "files" { "var(--accent-color)" } else { "transparent" }
+                            )
+                            on:click=move |_| set_sidebar_tab.set("files".to_string())
+                        >
+                            "Files"
+                        </button>
+                        <button
+                            style=move || format!("flex: 1; padding: 0.4rem 0.5rem; font-size: 0.8rem; border: none; border-radius: 0; background: transparent; color: {}; border-bottom: 2px solid {};",
+                                if sidebar_tab.get() == "recent" { "var(--accent-color)" } else { "var(--text-muted)" },
+                                if sidebar_tab.get() == "recent" { "var(--accent-color)" } else { "transparent" }
+                            )
+                            on:click=move |_| set_sidebar_tab.set("recent".to_string())
+                        >
+                            "Recent"
+                        </button>
+                    </div>
                     <div class="file-list" style="flex: 1; overflow-y: auto; padding: 0.75rem 0.5rem;">
                         {move || {
+                            let tab = sidebar_tab.get();
+                            if tab == "recent" {
+                                let recent = recent_notes.get();
+                                let files_in_vault = files.get();
+                                let valid: Vec<_> = recent.into_iter().filter(|p| files_in_vault.contains(p)).collect();
+                                if valid.is_empty() {
+                                    return view! {
+                                        <div style="padding: 0.5rem 0.75rem; font-size: 0.82rem; color: var(--text-muted);">
+                                            "No recent notes."
+                                        </div>
+                                    }.into_any();
+                                }
+                                return view! {
+                                    <>
+                                        {valid.into_iter().map(|path| {
+                                            let filename = path.clone();
+                                            let active_path = path.clone();
+                                            let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+                                            let is_active = move || current_file.get() == active_path;
+                                            view! {
+                                                <div
+                                                    style=move || format!(
+                                                        "padding: 0.38rem 0.65rem 0.38rem 1.5rem; cursor: pointer; border-radius: var(--radius-md); margin-bottom: 2px; font-size: 0.84rem; transition: background 0.2s, color 0.2s; {}",
+                                                        if is_active() { "background: var(--accent-color); color: white;" } else { "color: var(--text-secondary);" }
+                                                    )
+                                                    on:click=move |_| select_file(filename.clone())
+                                                    title=path.clone()
+                                                >
+                                                    {name}
+                                                </div>
+                                            }
+                                        }).collect::<Vec<_>>()}
+                                    </>
+                                }.into_any();
+                            }
+
                             let files_in_vault = files.get();
                             if files_in_vault.is_empty() {
                                 let msg = if vault_path.get().is_empty() {
