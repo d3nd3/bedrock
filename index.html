@@ -16,6 +16,34 @@
         window.__TAURI__.event.listen('settings-updated', (e) => {
           window.dispatchEvent(new CustomEvent('bedrock-settings', { detail: e.payload }));
         });
+        window.__TAURI__.event.listen('save-state-and-close', async () => {
+          const stateSavedPromise = new Promise((resolve) => {
+            const handler = () => {
+              window.removeEventListener('bedrock-state-saved', handler);
+              resolve();
+            };
+            window.addEventListener('bedrock-state-saved', handler);
+            window.dispatchEvent(new Event('bedrock-save-state-and-close'));
+          });
+          await Promise.race([stateSavedPromise, new Promise(r => setTimeout(r, 2500))]);
+          const state = window.__BEDROCK_STATE__;
+          if (state && state.vault_path && state.vault_path.length > 0) {
+            try {
+              let entries = (state.entries && Array.isArray(state.entries)) ? state.entries : [];
+              if (entries.length === 0 && state.current_file) {
+                const p = state.current_file;
+                entries = [{ path: p, title: p.split('/').pop() || p, last_opened: Date.now() }];
+              }
+              await window.__TAURI__.core.invoke('cache_recent_notes', {
+                vault_path: state.vault_path,
+                entries
+              });
+            } catch (_) {}
+          }
+          try {
+            await window.__TAURI__.core.invoke('close_window_now');
+          } catch (_) {}
+        });
       }
     });
   </script>

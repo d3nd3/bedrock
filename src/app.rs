@@ -1,819 +1,51 @@
+use crate::app_state::{AppSettings, RecentNoteEntry};
 use crate::editor_core::{
     apply_markdown_command, ChangeOrigin, EditorSnapshot, MarkdownCommand, Selection, TextChange,
     Transaction,
 };
-use js_sys::{Object, Reflect};
+use crate::markdown_syntax::{FileCache, MetadataCacheState};
+use crate::metadata_sidebar::MetadataSidebar;
+use crate::path_utils::{collapse_path, normalize_rel_path};
+use crate::recent_notes_pane::RecentNotesPane;
+use crate::sidebar_panel::SidebarPanel;
+use crate::sidebar_tree::{expand_parent_folders, SidebarContextMenu};
+use crate::editor_pane::EditorPane;
+use crate::tauri_bridge;
+use crate::top_bar::TopBar;
+use js_sys::{Object, Reflect, Date};
 use leptos::html;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
-use leptos::web_sys::{HtmlElement, Node};
-use regex::Regex;
-use serde::{Deserialize, Serialize};
+use leptos::web_sys::{Element, Event, HtmlElement, KeyboardEvent, Node};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::OnceLock;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
-#[wasm_bindgen]
-extern "C" {
-    #[wasm_bindgen(js_namespace = ["window", "__TAURI__", "core"])]
-    async fn invoke(cmd: &str, args: JsValue) -> JsValue;
-}
-
-#[derive(Serialize)]
-struct ReadDirArgs<'a> {
-    path: &'a str,
-}
-#[derive(Deserialize)]
-struct ReadDirResult {
-    notes: Vec<String>,
-    empty_dirs: Vec<String>,
-}
-#[derive(Serialize)]
-struct ReadFileArgs<'a> {
-    path: &'a str,
-}
-#[derive(Serialize)]
-struct WriteFileArgs<'a> {
-    path: &'a str,
-    content: &'a str,
-}
-#[derive(Serialize)]
-struct SaveSettingsArgs<'a> {
-    vault_path: &'a str,
-    settings: &'a str,
-}
-#[derive(Serialize)]
-struct VaultPathArgs<'a> {
-    vault_path: &'a str,
-}
-#[derive(Serialize)]
-struct RenameNoteArgs<'a> {
-    vault_path: &'a str,
-    old_path: &'a str,
-    new_path: &'a str,
-}
-#[derive(Serialize)]
-struct SaveRecentNotesArgs<'a> {
-    vault_path: &'a str,
-    paths: &'a [String],
-}
-
-#[derive(Deserialize, Clone, Debug)]
-struct VaultNote {
-    path: String,
-    content: String,
-}
-
-#[derive(Deserialize, Clone, Debug)]
-struct VaultImportReport {
-    success: bool,
-    cancelled: bool,
-    message: String,
-    source_vault: Option<String>,
-    destination_vault: Option<String>,
-    scanned_notes: usize,
-    imported_notes: usize,
-    scanned_images: usize,
-    imported_images: usize,
-    renamed_notes: usize,
-}
-
-#[derive(Deserialize, Clone, Debug, Default)]
-struct VaultSessionState {
-    open_vaults: Vec<String>,
-    active_vault: Option<String>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-struct AppSettings {
-    font_size: u32,
-    accent_color: String,
-    bg_primary: String,
-    bg_secondary: String,
-    text_primary: String,
-    md_h1_color: String,
-    md_h2_color: String,
-    md_h3_color: String,
-    md_h4_color: String,
-    md_bold_color: String,
-    md_italic_color: String,
-    md_code_bg: String,
-    md_code_text: String,
-    md_quote_color: String,
-}
-
-impl Default for AppSettings {
-    fn default() -> Self {
-        Self {
-            font_size: 16,
-            accent_color: "#6366f1".to_string(),
-            bg_primary: "#ffffff".to_string(),
-            bg_secondary: "#f4f5f7".to_string(),
-            text_primary: "#1a1a1a".to_string(),
-            md_h1_color: "#1a1a1a".to_string(),
-            md_h2_color: "#1a1a1a".to_string(),
-            md_h3_color: "#1a1a1a".to_string(),
-            md_h4_color: "#1a1a1a".to_string(),
-            md_bold_color: "#4f46e5".to_string(),
-            md_italic_color: "#1a1a1a".to_string(),
-            md_code_bg: "#e9ecef".to_string(),
-            md_code_text: "#1a1a1a".to_string(),
-            md_quote_color: "#9ca3af".to_string(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-struct HeadingCache {
-    level: u8,
-    text: String,
-    line: usize,
-}
-
-#[derive(Clone, Debug, Default)]
-struct FileCache {
-    headings: Vec<HeadingCache>,
-    tags: Vec<String>,
-    links: Vec<String>,
-}
-
-#[derive(Clone, Debug, Default)]
-struct MetadataCacheState {
-    file_cache: HashMap<String, FileCache>,
-    resolved_links: HashMap<String, HashMap<String, usize>>,
-    unresolved_links: HashMap<String, HashMap<String, usize>>,
-    backlinks: HashMap<String, Vec<String>>,
-    tags_index: HashMap<String, Vec<String>>,
-}
-
-#[derive(Clone, Debug, Default)]
-struct FolderTreeNode {
-    name: String,
-    path: String,
-    folders: Vec<FolderTreeNode>,
-    files: Vec<String>,
-    note_count: usize,
-}
-
-#[derive(Clone, Debug, Default)]
-struct FileTree {
-    root_files: Vec<String>,
-    folders: Vec<FolderTreeNode>,
-}
-
-#[derive(Clone, Debug)]
-enum SidebarEntry {
-    Folder {
-        path: String,
-        name: String,
-        depth: usize,
-        note_count: usize,
-        expanded: bool,
-    },
-    File {
-        path: String,
-        name: String,
-        depth: usize,
-    },
-}
-
-#[derive(Clone)]
-enum SidebarContextMenu {
-    Folder { path: String, x: f64, y: f64 },
-    File { path: String, x: f64, y: f64 },
-}
-
-struct InlineMatch {
-    start: usize,
-    end: usize,
-    inner_start: usize,
-    inner_end: usize,
-    open_len: usize,
-    close_len: usize,
-    class: &'static str,
-    hide_tokens: bool,
-    preview_html: Option<String>,
-    hide_entire_unless_caret: bool,
-}
-
-struct ImageRenderContext<'a> {
-    vault_path: &'a str,
-    current_file: &'a str,
-    cache: &'a HashMap<String, String>,
-}
-
-fn is_escaped_at(bytes: &[u8], idx: usize) -> bool {
-    if idx == 0 {
-        return false;
-    }
-    let mut cursor = idx;
-    let mut slash_count = 0usize;
-    while cursor > 0 {
-        cursor -= 1;
-        if bytes[cursor] == b'\\' {
-            slash_count += 1;
-        } else {
-            break;
-        }
-    }
-    slash_count % 2 == 1
-}
-
-fn find_delimiter_positions(text: &str, delimiter: &str) -> Vec<usize> {
-    let marker = delimiter.as_bytes();
-    if marker.is_empty() {
-        return Vec::new();
-    }
-
-    let bytes = text.as_bytes();
-    let mut out = Vec::new();
-    let mut idx = 0usize;
-    while idx + marker.len() <= bytes.len() {
-        if &bytes[idx..idx + marker.len()] == marker && !is_escaped_at(bytes, idx) {
-            out.push(idx);
-            idx += marker.len();
-        } else {
-            idx += 1;
-        }
-    }
-    out
-}
-
-fn collect_delimited_matches(
-    text: &str,
-    delimiter: &str,
-    class: &'static str,
-    hide_tokens: bool,
-) -> Vec<InlineMatch> {
-    let token_len = delimiter.len();
-    if token_len == 0 {
-        return Vec::new();
-    }
-
-    let token_positions = find_delimiter_positions(text, delimiter);
-    let mut out = Vec::new();
-    let mut pending_open: Option<usize> = None;
-    for token in token_positions {
-        if let Some(open) = pending_open.take() {
-            let close = token;
-            out.push(InlineMatch {
-                start: open,
-                end: close + token_len,
-                inner_start: open + token_len,
-                inner_end: close,
-                open_len: token_len,
-                close_len: token_len,
-                class,
-                hide_tokens,
-                preview_html: None,
-                hide_entire_unless_caret: false,
-            });
-        } else {
-            pending_open = Some(token);
-        }
-    }
-
-    if let Some(open) = pending_open {
-        out.push(InlineMatch {
-            start: open,
-            end: text.len(),
-            // Keep unmatched opening markers visible to avoid caret drift while
-            // users are still typing the closing token.
-            inner_start: open,
-            inner_end: text.len(),
-            open_len: 0,
-            close_len: 0,
-            class,
-            hide_tokens,
-            preview_html: None,
-            hide_entire_unless_caret: false,
-        });
-    }
-
-    out
-}
-
-fn overlaps_existing(matches: &[InlineMatch], start: usize, end: usize) -> bool {
-    matches.iter().any(|x| start < x.end && end > x.start)
-}
-
-fn push_non_overlapping(matches: &mut Vec<InlineMatch>, candidate: InlineMatch) {
-    if !overlaps_existing(matches, candidate.start, candidate.end) {
-        matches.push(candidate);
-    }
-}
-
-fn wrap_line(class: &str, html: String) -> String {
-    format!("<span class=\"{class}\">{html}</span>")
-}
-
-fn code_fence_open(line: &str) -> Option<(u8, usize)> {
-    let trimmed = line.trim_start();
-    let bytes = trimmed.as_bytes();
-    if bytes.len() < 3 {
-        return None;
-    }
-    let marker = bytes[0];
-    if marker != b'`' && marker != b'~' {
-        return None;
-    }
-    let mut len = 0usize;
-    while len < bytes.len() && bytes[len] == marker {
-        len += 1;
-    }
-    if len >= 3 {
-        Some((marker, len))
-    } else {
-        None
-    }
-}
-
-fn code_fence_close(line: &str, marker: u8, min_len: usize) -> bool {
-    let trimmed = line.trim_start();
-    let bytes = trimmed.as_bytes();
-    if bytes.len() < min_len || bytes.first().copied() != Some(marker) {
-        return false;
-    }
-    let mut len = 0usize;
-    while len < bytes.len() && bytes[len] == marker {
-        len += 1;
-    }
-    if len < min_len {
-        return false;
-    }
-    trimmed[len..].trim().is_empty()
-}
-
-fn escape_html(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
-fn normalize_rel_path(path: &str) -> String {
-    path.trim().replace('\\', "/").trim_matches('/').to_string()
-}
-
-fn vault_display_name(path: &str) -> String {
-    let normalized = normalize_slashes(path.trim().trim_end_matches('/'));
-    normalized
-        .rsplit('/')
-        .next()
-        .filter(|name| !name.is_empty())
-        .unwrap_or("Vault")
-        .to_string()
-}
-
-fn file_display_name(path: &str) -> String {
-    let normalized = normalize_slashes(path);
-    normalized
-        .rsplit('/')
-        .next()
-        .filter(|name| !name.is_empty())
-        .unwrap_or(path)
-        .to_string()
-}
-
-fn insert_file_into_folders(
-    folders: &mut Vec<FolderTreeNode>,
-    folder_parts: &[&str],
-    file_path: &str,
-    prefix: &str,
-) {
-    if folder_parts.is_empty() {
-        return;
-    }
-
-    let name = folder_parts[0];
-    let path = if prefix.is_empty() {
-        name.to_string()
-    } else {
-        format!("{prefix}/{name}")
-    };
-
-    let idx = if let Some(pos) = folders.iter().position(|f| f.name == name) {
-        pos
-    } else {
-        folders.push(FolderTreeNode {
-            name: name.to_string(),
-            path: path.clone(),
-            folders: Vec::new(),
-            files: Vec::new(),
-            note_count: 0,
-        });
-        folders.len() - 1
-    };
-
-    if folder_parts.len() == 1 {
-        folders[idx].files.push(file_path.to_string());
-    } else {
-        insert_file_into_folders(
-            &mut folders[idx].folders,
-            &folder_parts[1..],
-            file_path,
-            &path,
-        );
-    }
-}
-
-fn finalize_folder_tree(nodes: &mut Vec<FolderTreeNode>) {
-    nodes.sort_by(|a, b| {
-        a.name
-            .to_ascii_lowercase()
-            .cmp(&b.name.to_ascii_lowercase())
-    });
-    for node in nodes.iter_mut() {
-        finalize_folder_tree(&mut node.folders);
-        node.files
-            .sort_by(|a, b| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()));
-        node.note_count = node.files.len()
-            + node
-                .folders
-                .iter()
-                .map(|folder| folder.note_count)
-                .sum::<usize>();
-    }
-}
-
-fn ensure_empty_folder_path(folders: &mut Vec<FolderTreeNode>, path_parts: &[&str], prefix: &str) {
-    if path_parts.is_empty() {
-        return;
-    }
-    let name = path_parts[0];
-    let path = if prefix.is_empty() {
-        name.to_string()
-    } else {
-        format!("{prefix}/{name}")
-    };
-    let idx = if let Some(pos) = folders.iter().position(|f| f.name == name) {
-        pos
-    } else {
-        folders.push(FolderTreeNode {
-            name: name.to_string(),
-            path: path.clone(),
-            folders: Vec::new(),
-            files: Vec::new(),
-            note_count: 0,
-        });
-        folders.len() - 1
-    };
-    if path_parts.len() > 1 {
-        ensure_empty_folder_path(&mut folders[idx].folders, &path_parts[1..], &path);
-    }
-}
-
-fn add_empty_dirs_to_tree(tree: &mut FileTree, empty_dirs: &[String]) {
-    for d in empty_dirs {
-        let parts: Vec<&str> = d.split('/').filter(|s| !s.is_empty()).collect();
-        if !parts.is_empty() {
-            ensure_empty_folder_path(&mut tree.folders, &parts, "");
-        }
-    }
-    finalize_folder_tree(&mut tree.folders);
-}
-
-fn build_file_tree(files: &[String]) -> FileTree {
-    let mut tree = FileTree::default();
-    for raw in files {
-        let path = normalize_slashes(raw);
-        let parts = path
-            .split('/')
-            .filter(|segment| !segment.is_empty())
-            .collect::<Vec<_>>();
-        if parts.is_empty() {
-            continue;
-        }
-        if parts.len() == 1 {
-            tree.root_files.push(path);
-            continue;
-        }
-        insert_file_into_folders(&mut tree.folders, &parts[..parts.len() - 1], &path, "");
-    }
-
-    tree.root_files
-        .sort_by(|a, b| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()));
-    finalize_folder_tree(&mut tree.folders);
-    tree
-}
-
-fn collect_sidebar_entries_from_folders(
-    nodes: &[FolderTreeNode],
-    expanded_folders: &HashSet<String>,
-    depth: usize,
-    out: &mut Vec<SidebarEntry>,
-) {
-    for folder in nodes {
-        let expanded = expanded_folders.contains(&folder.path);
-        out.push(SidebarEntry::Folder {
-            path: folder.path.clone(),
-            name: folder.name.clone(),
-            depth,
-            note_count: folder.note_count,
-            expanded,
-        });
-        if expanded {
-            collect_sidebar_entries_from_folders(&folder.folders, expanded_folders, depth + 1, out);
-            for file_path in &folder.files {
-                out.push(SidebarEntry::File {
-                    path: file_path.clone(),
-                    name: file_display_name(file_path),
-                    depth: depth + 1,
-                });
-            }
-        }
-    }
-}
-
-fn build_sidebar_entries(tree: &FileTree, expanded_folders: &HashSet<String>) -> Vec<SidebarEntry> {
-    let mut out = Vec::new();
-    collect_sidebar_entries_from_folders(&tree.folders, expanded_folders, 0, &mut out);
-    for file_path in &tree.root_files {
-        out.push(SidebarEntry::File {
-            path: file_path.clone(),
-            name: file_display_name(file_path),
-            depth: 0,
-        });
-    }
-    out
-}
-
-fn parent_folder_chain(file_path: &str) -> Vec<String> {
-    let normalized = normalize_slashes(file_path);
-    let mut parts = normalized
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
-    if parts.len() <= 1 {
-        return Vec::new();
-    }
-    parts.pop();
-
-    let mut out = Vec::new();
-    let mut current = String::new();
-    for part in parts {
-        if !current.is_empty() {
-            current.push('/');
-        }
-        current.push_str(part);
-        out.push(current.clone());
-    }
-    out
-}
-
-fn expand_parent_folders(expanded_folders: &mut HashSet<String>, file_path: &str) {
-    for folder in parent_folder_chain(file_path) {
-        expanded_folders.insert(folder);
-    }
-}
+// File tree and sidebar helpers now live in `sidebar_tree.rs`.
 
 fn normalize_pasted_text(text: &str) -> String {
-    text.replace("\r\n", "\n")
-        .replace('\r', "\n")
-        .replace('\u{00A0}', " ")
-}
-
-fn escape_html_attr(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('"', "&quot;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
-fn normalize_slashes(path: &str) -> String {
-    path.replace('\\', "/")
-}
-
-fn collapse_path(path: &str) -> String {
-    let normalized = normalize_slashes(path);
-    let bytes = normalized.as_bytes();
-    let (prefix, rest) = if normalized.starts_with('/') {
-        (
-            "/".to_string(),
-            normalized.trim_start_matches('/').to_string(),
-        )
-    } else if bytes.len() >= 2 && bytes[1] == b':' {
-        let drive = normalized[..2].to_string();
-        let tail = normalized[2..].trim_start_matches('/').to_string();
-        (format!("{drive}/"), tail)
-    } else {
-        (String::new(), normalized)
-    };
-
-    let mut parts: Vec<&str> = Vec::new();
-    for segment in rest.split('/') {
-        if segment.is_empty() || segment == "." {
-            continue;
-        }
-        if segment == ".." {
-            if !parts.is_empty() {
-                parts.pop();
-            }
-            continue;
-        }
-        parts.push(segment);
-    }
-
-    let joined = parts.join("/");
-    if prefix.is_empty() {
-        joined
-    } else {
-        format!("{prefix}{joined}")
-    }
-}
-
-fn strip_wiki_target(raw: &str) -> String {
-    raw.trim()
-        .split('|')
-        .next()
-        .unwrap_or_default()
-        .split('#')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_string()
-}
-
-fn strip_markdown_image_target(raw: &str) -> String {
-    let trimmed = raw.trim();
-    let base = if trimmed.starts_with('<') {
-        trimmed
-            .trim_start_matches('<')
-            .split('>')
-            .next()
-            .unwrap_or_default()
-            .trim()
-    } else {
-        trimmed.split_whitespace().next().unwrap_or_default().trim()
-    };
-    base.split('#')
-        .next()
-        .unwrap_or_default()
-        .split('?')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_string()
-}
-
-fn image_extension(path: &str) -> Option<String> {
-    let normalized = normalize_slashes(path);
-    let ext = Path::new(&normalized)
-        .extension()?
-        .to_str()?
-        .to_ascii_lowercase();
-    Some(ext)
-}
-
-fn is_supported_inline_image_path(path: &str) -> bool {
-    matches!(
-        image_extension(path).as_deref(),
-        Some(
-            "png"
-                | "jpg"
-                | "jpeg"
-                | "gif"
-                | "webp"
-                | "bmp"
-                | "svg"
-                | "tif"
-                | "tiff"
-                | "ico"
-                | "avif"
-                | "heic"
-                | "heif"
-        )
-    )
+    crate::markdown_syntax::normalize_pasted_text(text)
 }
 
 fn image_mime_for_path(path: &str) -> &'static str {
-    match image_extension(path).as_deref() {
-        Some("png") => "image/png",
-        Some("jpg") | Some("jpeg") => "image/jpeg",
-        Some("gif") => "image/gif",
-        Some("webp") => "image/webp",
-        Some("bmp") => "image/bmp",
-        Some("svg") => "image/svg+xml",
-        Some("tif") | Some("tiff") => "image/tiff",
-        Some("ico") => "image/x-icon",
-        Some("avif") => "image/avif",
-        Some("heic") => "image/heic",
-        Some("heif") => "image/heif",
-        _ => "application/octet-stream",
-    }
+    crate::markdown_syntax::image_mime_for_path(path)
+}
+
+fn is_supported_inline_image_path(path: &str) -> bool {
+    crate::markdown_syntax::image_mime_for_path(path) != "application/octet-stream"
 }
 
 fn looks_like_external_url(target: &str) -> bool {
-    let t = target.trim().to_ascii_lowercase();
-    t.contains("://") || t.starts_with("data:")
-}
-
-fn current_note_dir(note_path: &str) -> String {
-    let normalized = normalize_slashes(note_path);
-    normalized
-        .rsplit_once('/')
-        .map(|(dir, _)| dir.to_string())
-        .unwrap_or_default()
-}
-
-fn is_path_within(base: &str, candidate: &str) -> bool {
-    let base_norm = collapse_path(base).trim_end_matches('/').to_string();
-    let candidate_norm = collapse_path(candidate);
-    if base_norm.is_empty() {
-        return false;
-    }
-    candidate_norm == base_norm || candidate_norm.starts_with(&format!("{base_norm}/"))
+    crate::markdown_syntax::looks_like_external_url(target)
 }
 
 fn image_local_candidates(vault_path: &str, note_path: &str, target: &str) -> Vec<String> {
-    if target.is_empty() || !is_supported_inline_image_path(target) {
-        return Vec::new();
-    }
-    if looks_like_external_url(target) {
-        return Vec::new();
-    }
-
-    let mut out = Vec::new();
-    let target_norm = normalize_slashes(target.trim());
-    let vault_norm = collapse_path(vault_path);
-
-    let is_windows_abs = {
-        let b = target_norm.as_bytes();
-        b.len() >= 2 && b[1] == b':'
-    };
-    if is_windows_abs {
-        // Keep auto-render strictly within the active vault.
-        return Vec::new();
-    }
-    if target_norm.starts_with('/') {
-        out.push(collapse_path(&format!(
-            "{vault_norm}/{}",
-            target_norm.trim_start_matches('/')
-        )));
-        return out;
-    }
-
-    let note_dir = current_note_dir(note_path);
-
-    if !note_dir.is_empty() {
-        out.push(collapse_path(&format!(
-            "{vault_norm}/{note_dir}/{target_norm}"
-        )));
-    }
-    out.push(collapse_path(&format!("{vault_norm}/{target_norm}")));
-    out.retain(|candidate| is_path_within(&vault_norm, candidate));
-    out.sort();
-    out.dedup();
-    out
+    crate::markdown_syntax::image_local_candidates(vault_path, note_path, target)
 }
 
 fn collect_image_targets_for_note(text: &str) -> Vec<(String, bool)> {
-    static RE_EMBED: OnceLock<Regex> = OnceLock::new();
-    static RE_MD_IMAGE: OnceLock<Regex> = OnceLock::new();
-
-    let re_embed = RE_EMBED.get_or_init(|| Regex::new(r"!\[\[([^\]\n]+)\]\]").unwrap());
-    let re_md_image =
-        RE_MD_IMAGE.get_or_init(|| Regex::new(r"!\[([^\]\n]*)\]\(([^)\n]+)\)").unwrap());
-
-    let mut out = Vec::new();
-    for cap in re_embed.captures_iter(text) {
-        let raw = cap.get(1).map(|m| m.as_str()).unwrap_or_default();
-        out.push((strip_wiki_target(raw), true));
-    }
-    for cap in re_md_image.captures_iter(text) {
-        let raw = cap.get(2).map(|m| m.as_str()).unwrap_or_default();
-        out.push((strip_markdown_image_target(raw), false));
-    }
-    out
-}
-
-fn resolve_image_preview_html(
-    ctx: Option<&ImageRenderContext>,
-    target: &str,
-    alt: Option<&str>,
-) -> Option<String> {
-    if target.is_empty() || !is_supported_inline_image_path(target) {
-        return None;
-    }
-
-    let src = if looks_like_external_url(target) {
-        target.to_string()
-    } else {
-        let ctx = ctx?;
-        let candidates = image_local_candidates(ctx.vault_path, ctx.current_file, target);
-        let path = candidates
-            .into_iter()
-            .find(|candidate| ctx.cache.contains_key(candidate))?;
-        ctx.cache.get(&path)?.to_string()
-    };
-
-    let alt = alt.unwrap_or_default();
-    Some(format!(
-        "<span class=\"md-inline-image-wrap\" contenteditable=\"false\"><img class=\"md-inline-image\" src=\"{}\" alt=\"{}\"/></span>",
-        escape_html_attr(&src),
-        escape_html_attr(alt)
-    ))
+    crate::markdown_syntax::collect_image_targets_for_note(text)
 }
 
 fn is_selection_navigation_key(key: &str) -> bool {
@@ -904,6 +136,37 @@ fn compute_dom_offset(root: &Node, container: &Node, offset: u32) -> Option<usiz
     }
 }
 
+fn find_ancestor_with_class(node: &Node, class: &str) -> Option<Node> {
+    if let Ok(el) = node.clone().dyn_into::<Element>() {
+        if el.class_list().contains(class) {
+            return Some(node.clone());
+        }
+    }
+    let mut current = node.clone();
+    loop {
+        let parent = current.parent_node()?;
+        if let Ok(el) = parent.clone().dyn_into::<Element>() {
+            if el.class_list().contains(class) {
+                return Some(parent);
+            }
+        }
+        current = parent;
+    }
+}
+
+fn offset_before_node(root: &Node, node: &Node) -> Option<usize> {
+    let mut text_nodes = Vec::new();
+    collect_text_nodes(root, &mut text_nodes);
+    let mut sum = 0usize;
+    for tn in &text_nodes {
+        if node.contains(Some(tn)) {
+            return Some(sum);
+        }
+        sum += tn.node_value().unwrap_or_default().len();
+    }
+    Some(sum)
+}
+
 fn find_text_position(nodes: &[Node], target: usize) -> Option<(Node, u32)> {
     let mut consumed = 0usize;
     for node in nodes {
@@ -924,25 +187,77 @@ fn find_text_position(nodes: &[Node], target: usize) -> Option<(Node, u32)> {
     })
 }
 
-fn get_selection_byte_offsets(root: &HtmlElement) -> Option<Selection> {
+fn offset_after_previous_sibling(root: &Node, container: &Node, class: &str, text_len: usize) -> Option<usize> {
+    let wrap = find_ancestor_with_class(container, class)?;
+    let prev = wrap.previous_sibling()?;
+    let before = offset_before_node(root, &prev)?;
+    Some((before + node_text_len(&prev)).min(text_len))
+}
+
+fn range_to_byte_offset(
+    root: &Node,
+    text_len: usize,
+    container: &Node,
+    offset: u32,
+) -> Option<usize> {
+    compute_dom_offset(root, container, offset)
+        .or_else(|| offset_after_previous_sibling(root, container, "md-inline-image-wrap", text_len))
+        .or_else(|| offset_after_previous_sibling(root, container, "md-embed-line-end", text_len))
+}
+
+fn get_selection_byte_offsets_with_collapsed(root: &HtmlElement) -> Option<(Selection, bool)> {
     let win = leptos::web_sys::window()?;
-    let selection = win.get_selection().ok().flatten()?;
-    if selection.range_count() == 0 {
+    let dom_selection = win.get_selection().ok().flatten()?;
+    if dom_selection.range_count() == 0 {
         return None;
     }
-    let range = selection.get_range_at(0).ok()?;
     let root_node: Node = root.clone().unchecked_into();
+    let text_len = root_node.text_content().unwrap_or_default().len();
+    let text = root_node.text_content().unwrap_or_default();
 
-    let start_container = range.start_container().ok()?;
-    let end_container = range.end_container().ok()?;
-    if !root_node.contains(Some(&start_container)) || !root_node.contains(Some(&end_container)) {
-        return None;
+    let (start, end) = {
+        let range_idx = (dom_selection.range_count() - 1).max(0);
+        let range = dom_selection.get_range_at(range_idx).ok()?;
+        let start_container = range.start_container().ok()?;
+        let end_container = range.end_container().ok()?;
+        if !root_node.contains(Some(&start_container)) || !root_node.contains(Some(&end_container)) {
+            return None;
+        }
+        let start = range_to_byte_offset(&root_node, text_len, &start_container, range.start_offset().ok()?)?;
+        let end = range_to_byte_offset(&root_node, text_len, &end_container, range.end_offset().ok()?)?;
+        (start, end)
+    };
+
+    let sel = if dom_selection.range_count() > 1 {
+        let first_range = dom_selection.get_range_at(0).ok()?;
+        let first_start_container = first_range.start_container().ok()?;
+        let first_start = range_to_byte_offset(
+            &root_node,
+            text_len,
+            &first_start_container,
+            first_range.start_offset().ok()?,
+        )?;
+        let line_first = line_index_at(&text, first_start);
+        let line_last = line_index_at(&text, start);
+        let collapse_pos = if line_last > line_first {
+            line_start(&text, line_first + 1).min(text_len)
+        } else {
+            start
+        };
+        Selection::cursor(collapse_pos)
+    } else {
+        Selection::new(start, end)
+    };
+
+    let did_collapse = dom_selection.range_count() > 1;
+    if did_collapse {
+        set_selection_byte_offsets(root, sel);
     }
+    Some((sel, did_collapse))
+}
 
-    let start = compute_dom_offset(&root_node, &start_container, range.start_offset().ok()?)?;
-    let end = compute_dom_offset(&root_node, &end_container, range.end_offset().ok()?)?;
-
-    Some(Selection::new(start, end))
+fn get_selection_byte_offsets(root: &HtmlElement) -> Option<Selection> {
+    get_selection_byte_offsets_with_collapsed(root).map(|(s, _)| s)
 }
 
 fn set_selection_byte_offsets(root: &HtmlElement, selection: Selection) {
@@ -986,485 +301,21 @@ fn set_selection_byte_offsets(root: &HtmlElement, selection: Selection) {
     let _ = dom_selection.add_range(&range);
 }
 
-fn highlight_inline(
-    text: &str,
-    caret: Option<usize>,
-    image_ctx: Option<&ImageRenderContext>,
-) -> String {
-    static RE_EMBED: OnceLock<Regex> = OnceLock::new();
-    static RE_WIKI: OnceLock<Regex> = OnceLock::new();
-    static RE_MD_LINK: OnceLock<Regex> = OnceLock::new();
-    static RE_MD_IMAGE: OnceLock<Regex> = OnceLock::new();
-    static RE_CODE: OnceLock<Regex> = OnceLock::new();
-    static RE_INLINE_MATH: OnceLock<Regex> = OnceLock::new();
-    static RE_FOOTNOTE_REF: OnceLock<Regex> = OnceLock::new();
-    static RE_INLINE_FOOTNOTE: OnceLock<Regex> = OnceLock::new();
-    static RE_BLOCK_ID: OnceLock<Regex> = OnceLock::new();
-    static RE_TAG: OnceLock<Regex> = OnceLock::new();
-
-    let re_embed = RE_EMBED.get_or_init(|| Regex::new(r"!\[\[([^\]\n]+)\]\]").unwrap());
-    let re_wiki = RE_WIKI.get_or_init(|| Regex::new(r"\[\[([^\]]+)\]\]").unwrap());
-    let re_md_link = RE_MD_LINK.get_or_init(|| Regex::new(r"\[([^\]\n]+)\]\(([^)\n]+)\)").unwrap());
-    let re_md_image =
-        RE_MD_IMAGE.get_or_init(|| Regex::new(r"!\[([^\]\n]*)\]\(([^)\n]+)\)").unwrap());
-    let re_code = RE_CODE.get_or_init(|| Regex::new(r"`([^`\n]+)`").unwrap());
-    let re_inline_math = RE_INLINE_MATH.get_or_init(|| Regex::new(r"\$([^$\n]+)\$").unwrap());
-    let re_footnote_ref = RE_FOOTNOTE_REF.get_or_init(|| Regex::new(r"\[\^[^\]\n]+\]").unwrap());
-    let re_inline_footnote =
-        RE_INLINE_FOOTNOTE.get_or_init(|| Regex::new(r"\^\[[^\]\n]+\]").unwrap());
-    let re_block_id =
-        RE_BLOCK_ID.get_or_init(|| Regex::new(r"\^[A-Za-z0-9][A-Za-z0-9-]*").unwrap());
-    let re_tag = RE_TAG.get_or_init(|| Regex::new(r"#[A-Za-z][A-Za-z0-9_/-]*").unwrap());
-
-    let mut matches: Vec<InlineMatch> = Vec::new();
-
-    // Inline code has the highest precedence.
-    for cap in re_code.captures_iter(text) {
-        let m = cap.get(0).unwrap();
-        let inner = cap.get(1).unwrap();
-        push_non_overlapping(
-            &mut matches,
-            InlineMatch {
-                start: m.start(),
-                end: m.end(),
-                inner_start: inner.start(),
-                inner_end: inner.end(),
-                open_len: 1,
-                close_len: 1,
-                class: "hl-code",
-                hide_tokens: true,
-                preview_html: None,
-                hide_entire_unless_caret: false,
-            },
-        );
-    }
-
-    // Obsidian comments: %% comment %% (including unmatched opener while typing).
-    for m in collect_delimited_matches(text, "%%", "hl-comment", false) {
-        push_non_overlapping(&mut matches, m);
-    }
-
-    for cap in re_embed.captures_iter(text) {
-        let m = cap.get(0).unwrap();
-        let inner = cap.get(1).unwrap();
-        let target = strip_wiki_target(inner.as_str());
-        let preview_html = resolve_image_preview_html(image_ctx, &target, None);
-        push_non_overlapping(
-            &mut matches,
-            InlineMatch {
-                start: m.start(),
-                end: m.end(),
-                inner_start: inner.start(),
-                inner_end: inner.end(),
-                open_len: 3,
-                close_len: 2,
-                class: "hl-embed",
-                hide_tokens: true,
-                preview_html,
-                hide_entire_unless_caret: false,
-            },
-        );
-    }
-
-    for cap in re_wiki.captures_iter(text) {
-        let m = cap.get(0).unwrap();
-        let inner = cap.get(1).unwrap();
-        push_non_overlapping(
-            &mut matches,
-            InlineMatch {
-                start: m.start(),
-                end: m.end(),
-                inner_start: inner.start(),
-                inner_end: inner.end(),
-                open_len: 2,
-                close_len: 2,
-                class: "hl-link",
-                hide_tokens: true,
-                preview_html: None,
-                hide_entire_unless_caret: false,
-            },
-        );
-    }
-
-    for cap in re_md_image.captures_iter(text) {
-        let m = cap.get(0).unwrap();
-        let alt = cap.get(1).map(|m| m.as_str()).unwrap_or_default();
-        let raw_target = cap.get(2).map(|m| m.as_str()).unwrap_or_default();
-        let target = strip_markdown_image_target(raw_target);
-        let preview_html = resolve_image_preview_html(image_ctx, &target, Some(alt));
-        push_non_overlapping(
-            &mut matches,
-            InlineMatch {
-                start: m.start(),
-                end: m.end(),
-                inner_start: m.start(),
-                inner_end: m.end(),
-                open_len: 0,
-                close_len: 0,
-                class: "hl-embed",
-                hide_tokens: false,
-                preview_html,
-                hide_entire_unless_caret: true,
-            },
-        );
-    }
-
-    for cap in re_md_link.captures_iter(text) {
-        let m = cap.get(0).unwrap();
-        push_non_overlapping(
-            &mut matches,
-            InlineMatch {
-                start: m.start(),
-                end: m.end(),
-                inner_start: m.start(),
-                inner_end: m.end(),
-                open_len: 0,
-                close_len: 0,
-                class: "hl-link",
-                hide_tokens: false,
-                preview_html: None,
-                hide_entire_unless_caret: false,
-            },
-        );
-    }
-
-    for m in collect_delimited_matches(text, "***", "hl-bold hl-italic", true) {
-        push_non_overlapping(&mut matches, m);
-    }
-    for m in collect_delimited_matches(text, "___", "hl-bold hl-italic", true) {
-        push_non_overlapping(&mut matches, m);
-    }
-    for m in collect_delimited_matches(text, "**", "hl-bold", true) {
-        push_non_overlapping(&mut matches, m);
-    }
-    for m in collect_delimited_matches(text, "__", "hl-bold", true) {
-        push_non_overlapping(&mut matches, m);
-    }
-    for m in collect_delimited_matches(text, "~~", "hl-strike", true) {
-        push_non_overlapping(&mut matches, m);
-    }
-    for m in collect_delimited_matches(text, "==", "hl-mark", true) {
-        push_non_overlapping(&mut matches, m);
-    }
-    for m in collect_delimited_matches(text, "*", "hl-italic", true) {
-        push_non_overlapping(&mut matches, m);
-    }
-    for m in collect_delimited_matches(text, "_", "hl-italic", true) {
-        push_non_overlapping(&mut matches, m);
-    }
-
-    for cap in re_inline_math.captures_iter(text) {
-        let m = cap.get(0).unwrap();
-        let inner = cap.get(1).unwrap();
-        push_non_overlapping(
-            &mut matches,
-            InlineMatch {
-                start: m.start(),
-                end: m.end(),
-                inner_start: inner.start(),
-                inner_end: inner.end(),
-                open_len: 1,
-                close_len: 1,
-                class: "hl-math-inline",
-                hide_tokens: true,
-                preview_html: None,
-                hide_entire_unless_caret: false,
-            },
-        );
-    }
-
-    for m in re_footnote_ref.find_iter(text) {
-        push_non_overlapping(
-            &mut matches,
-            InlineMatch {
-                start: m.start(),
-                end: m.end(),
-                inner_start: m.start(),
-                inner_end: m.end(),
-                open_len: 0,
-                close_len: 0,
-                class: "hl-footnote",
-                hide_tokens: false,
-                preview_html: None,
-                hide_entire_unless_caret: false,
-            },
-        );
-    }
-
-    for m in re_inline_footnote.find_iter(text) {
-        push_non_overlapping(
-            &mut matches,
-            InlineMatch {
-                start: m.start(),
-                end: m.end(),
-                inner_start: m.start(),
-                inner_end: m.end(),
-                open_len: 0,
-                close_len: 0,
-                class: "hl-footnote",
-                hide_tokens: false,
-                preview_html: None,
-                hide_entire_unless_caret: false,
-            },
-        );
-    }
-
-    for m in re_tag.find_iter(text) {
-        push_non_overlapping(
-            &mut matches,
-            InlineMatch {
-                start: m.start(),
-                end: m.end(),
-                inner_start: m.start(),
-                inner_end: m.end(),
-                open_len: 0,
-                close_len: 0,
-                class: "hl-tag",
-                hide_tokens: false,
-                preview_html: None,
-                hide_entire_unless_caret: false,
-            },
-        );
-    }
-
-    for m in re_block_id.find_iter(text) {
-        push_non_overlapping(
-            &mut matches,
-            InlineMatch {
-                start: m.start(),
-                end: m.end(),
-                inner_start: m.start(),
-                inner_end: m.end(),
-                open_len: 0,
-                close_len: 0,
-                class: "hl-block-id",
-                hide_tokens: false,
-                preview_html: None,
-                hide_entire_unless_caret: false,
-            },
-        );
-    }
-
-    matches.sort_by_key(|m| m.start);
-    let mut disjoint: Vec<&InlineMatch> = Vec::new();
-    let mut last_end = 0usize;
-    for m in &matches {
-        if m.start >= last_end {
-            disjoint.push(m);
-            last_end = m.end;
-        }
-    }
-
-    let mut out = String::new();
-    let mut pos = 0usize;
-    for m in disjoint {
-        out.push_str(&escape_html(&text[pos..m.start]));
-        let caret_inside = caret.map(|c| c >= m.start && c <= m.end).unwrap_or(false);
-
-        if m.hide_entire_unless_caret && !caret_inside {
-            out.push_str("<span class=\"md-token md-token-hidden\">");
-            out.push_str(&escape_html(&text[m.start..m.end]));
-            out.push_str("</span>");
-            if let Some(preview) = &m.preview_html {
-                out.push_str(preview);
-            }
-        } else if caret_inside && m.hide_tokens {
-            // Keep live formatting active while caret is inside the markdown span,
-            // but reveal the wrapper tokens for accurate editing context.
-            out.push_str("<span class=\"md-token md-token-visible\">");
-            out.push_str(&escape_html(&text[m.start..m.start + m.open_len]));
-            out.push_str("</span><span class=\"");
-            out.push_str(m.class);
-            out.push_str("\">");
-            out.push_str(&escape_html(&text[m.inner_start..m.inner_end]));
-            out.push_str("</span><span class=\"md-token md-token-visible\">");
-            out.push_str(&escape_html(&text[m.end - m.close_len..m.end]));
-            out.push_str("</span>");
-        } else if caret_inside {
-            out.push_str(&escape_html(&text[m.start..m.end]));
-        } else if m.hide_tokens {
-            out.push_str("<span class=\"md-token md-token-hidden\">");
-            out.push_str(&escape_html(&text[m.start..m.start + m.open_len]));
-            out.push_str("</span><span class=\"");
-            out.push_str(m.class);
-            out.push_str("\">");
-            out.push_str(&escape_html(&text[m.inner_start..m.inner_end]));
-            out.push_str("</span><span class=\"md-token md-token-hidden\">");
-            out.push_str(&escape_html(&text[m.end - m.close_len..m.end]));
-            out.push_str("</span>");
-        } else {
-            out.push_str("<span class=\"");
-            out.push_str(m.class);
-            out.push_str("\">");
-            out.push_str(&escape_html(&text[m.start..m.end]));
-            out.push_str("</span>");
-        }
-        if let Some(preview) = &m.preview_html {
-            if !(m.hide_entire_unless_caret && !caret_inside) {
-                out.push_str(preview);
-            }
-        }
-        pos = m.end;
-    }
-    out.push_str(&escape_html(&text[pos..]));
-    out
+fn line_index_at(text: &str, byte_offset: usize) -> usize {
+    let end = byte_offset.min(text.len());
+    text[..end].lines().count().saturating_sub(1).max(0)
 }
 
-fn highlight_markdown(
-    text: &str,
-    caret: Option<usize>,
-    image_ctx: Option<&ImageRenderContext>,
-) -> String {
-    static RE_HEADING: OnceLock<Regex> = OnceLock::new();
-    static RE_CALLOUT: OnceLock<Regex> = OnceLock::new();
-    static RE_QUOTE: OnceLock<Regex> = OnceLock::new();
-    static RE_TASK: OnceLock<Regex> = OnceLock::new();
-    static RE_LIST: OnceLock<Regex> = OnceLock::new();
-    static RE_ORDERED: OnceLock<Regex> = OnceLock::new();
-    static RE_HR: OnceLock<Regex> = OnceLock::new();
-    static RE_TABLE_ROW: OnceLock<Regex> = OnceLock::new();
-    static RE_TABLE_SEPARATOR: OnceLock<Regex> = OnceLock::new();
-    static RE_FOOTNOTE_DEF: OnceLock<Regex> = OnceLock::new();
-
-    let re_heading = RE_HEADING.get_or_init(|| Regex::new(r"^(#{1,6})[^\S\n]+.*$").unwrap());
-    let re_callout =
-        RE_CALLOUT.get_or_init(|| Regex::new(r"^\s*>\s*\[![A-Za-z0-9-]+\][+-]?\s*.*$").unwrap());
-    let re_quote = RE_QUOTE.get_or_init(|| Regex::new(r"^\s*>\s+.*$").unwrap());
-    let re_task = RE_TASK.get_or_init(|| Regex::new(r"^\s*[-*+]\s+\[(?: |x|X)\]\s+.*$").unwrap());
-    let re_list = RE_LIST.get_or_init(|| Regex::new(r"^\s*[-*+]\s+.*$").unwrap());
-    let re_ordered = RE_ORDERED.get_or_init(|| Regex::new(r"^\s*\d+[.)]\s+.*$").unwrap());
-    let re_hr = RE_HR.get_or_init(|| {
-        Regex::new(r"^\s{0,3}(?:(?:\*[\t ]*){3,}|(?:-[\t ]*){3,}|(?:_[\t ]*){3,})\s*$").unwrap()
-    });
-    let re_table_row = RE_TABLE_ROW.get_or_init(|| Regex::new(r"^\s*\|.*\|\s*$").unwrap());
-    let re_table_separator = RE_TABLE_SEPARATOR.get_or_init(|| {
-        Regex::new(r"^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$").unwrap()
-    });
-    let re_footnote_def =
-        RE_FOOTNOTE_DEF.get_or_init(|| Regex::new(r"^\s*\[\^[^\]]+\]:\s+.*$").unwrap());
-
-    let mut out = String::new();
-    let mut offset = 0usize;
-    let mut in_frontmatter = false;
-    let mut frontmatter_possible = true;
-    let mut in_math_block = false;
-    let mut in_comment_block = false;
-    let mut code_fence: Option<(u8, usize)> = None;
-
-    for line in text.split_inclusive('\n') {
-        let line_len = line.len();
-        let line_without_nl = line.strip_suffix('\n').unwrap_or(line);
-        let trimmed = line_without_nl.trim();
-
-        if let Some((marker, min_len)) = code_fence {
-            out.push_str(&wrap_line("hl-codeblock", escape_html(line)));
-            if code_fence_close(line_without_nl, marker, min_len) {
-                code_fence = None;
-            }
-            offset += line_len;
-            continue;
-        }
-
-        if in_math_block {
-            out.push_str(&wrap_line("hl-math-block", escape_html(line)));
-            if trimmed == "$$" {
-                in_math_block = false;
-            }
-            offset += line_len;
-            continue;
-        }
-
-        if in_frontmatter {
-            out.push_str(&wrap_line("hl-frontmatter", escape_html(line)));
-            if trimmed == "---" || trimmed == "..." {
-                in_frontmatter = false;
-                frontmatter_possible = false;
-            }
-            offset += line_len;
-            continue;
-        }
-
-        if in_comment_block {
-            out.push_str(&wrap_line("hl-comment", escape_html(line)));
-            if line_without_nl.matches("%%").count() % 2 == 1 {
-                in_comment_block = false;
-            }
-            offset += line_len;
-            continue;
-        }
-
-        if frontmatter_possible {
-            if trimmed == "---" {
-                out.push_str(&wrap_line("hl-frontmatter", escape_html(line)));
-                in_frontmatter = true;
-                offset += line_len;
-                continue;
-            }
-            if !trimmed.is_empty() {
-                frontmatter_possible = false;
-            }
-        }
-
-        if let Some((marker, len)) = code_fence_open(line_without_nl) {
-            out.push_str(&wrap_line("hl-codeblock hl-code-fence", escape_html(line)));
-            code_fence = Some((marker, len));
-            offset += line_len;
-            continue;
-        }
-
-        if trimmed == "$$" {
-            out.push_str(&wrap_line("hl-math-block", escape_html(line)));
-            in_math_block = true;
-            offset += line_len;
-            continue;
-        }
-
-        let caret_rel = caret
-            .filter(|c| *c >= offset && *c < offset + line_len)
-            .map(|c| c - offset);
-        let line_html = highlight_inline(line, caret_rel, image_ctx);
-
-        let wrapped = if re_callout.is_match(line_without_nl) {
-            wrap_line("hl-callout", line_html)
-        } else if let Some(cap) = re_heading.captures(line_without_nl) {
-            let level = cap.get(1).map(|m| m.as_str().len()).unwrap_or(1);
-            match level {
-                1 => wrap_line("hl-h1", line_html),
-                2 => wrap_line("hl-h2", line_html),
-                3 => wrap_line("hl-h3", line_html),
-                4 => wrap_line("hl-h4", line_html),
-                5 => wrap_line("hl-h5", line_html),
-                _ => wrap_line("hl-h6", line_html),
-            }
-        } else if re_hr.is_match(line_without_nl) {
-            wrap_line("hl-hr", line_html)
-        } else if re_footnote_def.is_match(line_without_nl) {
-            wrap_line("hl-footnote-def", line_html)
-        } else if re_quote.is_match(line_without_nl) {
-            wrap_line("hl-quote", line_html)
-        } else if re_task.is_match(line_without_nl) {
-            wrap_line("hl-task", line_html)
-        } else if re_ordered.is_match(line_without_nl) || re_list.is_match(line_without_nl) {
-            wrap_line("hl-list", line_html)
-        } else if re_table_separator.is_match(line_without_nl)
-            || re_table_row.is_match(line_without_nl)
-        {
-            wrap_line("hl-table", line_html)
-        } else {
-            line_html
-        };
-        out.push_str(&wrapped);
-
-        if line_without_nl.matches("%%").count() % 2 == 1 {
-            in_comment_block = true;
-        }
-
-        offset += line_len;
+#[allow(dead_code)]
+fn line_start(text: &str, line_index: usize) -> usize {
+    if line_index == 0 {
+        return 0;
     }
-
-    out
+    text.match_indices('\n')
+        .nth(line_index.saturating_sub(1))
+        .map(|(i, _)| i + 1)
+        .unwrap_or(text.len())
 }
-
 fn highlight_markdown_for_editor(
     text: &str,
     caret: Option<usize>,
@@ -1472,92 +323,17 @@ fn highlight_markdown_for_editor(
     current_file: &str,
     image_cache: &HashMap<String, String>,
 ) -> String {
-    if vault_path.is_empty() || current_file.is_empty() {
-        return highlight_markdown(text, caret, None);
-    }
-    let ctx = ImageRenderContext {
+    crate::markdown_syntax::highlight_markdown_for_editor(
+        text,
+        caret,
         vault_path,
         current_file,
-        cache: image_cache,
-    };
-    highlight_markdown(text, caret, Some(&ctx))
+        image_cache,
+    )
 }
 
 fn extract_file_cache(text: &str) -> FileCache {
-    static RE_HEADING: OnceLock<Regex> = OnceLock::new();
-    static RE_WIKI: OnceLock<Regex> = OnceLock::new();
-    static RE_MD_LINK: OnceLock<Regex> = OnceLock::new();
-    static RE_TAG: OnceLock<Regex> = OnceLock::new();
-
-    let re_heading = RE_HEADING.get_or_init(|| Regex::new(r"^(#{1,6})[ \t]+(.+?)\s*$").unwrap());
-    let re_wiki = RE_WIKI.get_or_init(|| Regex::new(r"\[\[([^\]]+)\]\]").unwrap());
-    let re_md_link = RE_MD_LINK.get_or_init(|| Regex::new(r"!?\[[^\]\n]*\]\(([^)\n]+)\)").unwrap());
-    let re_tag = RE_TAG.get_or_init(|| Regex::new(r"#[A-Za-z][A-Za-z0-9_/-]*").unwrap());
-
-    let mut headings = Vec::new();
-    let mut tags = Vec::new();
-    let mut links = Vec::new();
-
-    for (idx, line) in text.lines().enumerate() {
-        if let Some(cap) = re_heading.captures(line) {
-            let level = cap.get(1).map(|m| m.as_str().len()).unwrap_or(1) as u8;
-            let text = cap
-                .get(2)
-                .map(|m| m.as_str().trim().to_string())
-                .unwrap_or_default();
-            headings.push(HeadingCache {
-                level,
-                text,
-                line: idx + 1,
-            });
-        }
-        for tag in re_tag.find_iter(line) {
-            tags.push(tag.as_str().trim_start_matches('#').to_ascii_lowercase());
-        }
-    }
-
-    for cap in re_wiki.captures_iter(text) {
-        let raw_inner = cap.get(1).map(|m| m.as_str()).unwrap_or_default();
-        let left = raw_inner.split('|').next().unwrap_or_default();
-        let link = left.split('#').next().unwrap_or_default().trim();
-        if !link.is_empty() {
-            links.push(normalize_rel_path(link));
-        }
-    }
-
-    for cap in re_md_link.captures_iter(text) {
-        let raw_target = cap.get(1).map(|m| m.as_str()).unwrap_or_default().trim();
-        let target = raw_target.trim_matches('<').trim_matches('>');
-        if target.is_empty() || target.starts_with('#') {
-            continue;
-        }
-        let lowered = target.to_ascii_lowercase();
-        if lowered.contains("://") || lowered.starts_with("mailto:") {
-            continue;
-        }
-        let cleaned = target
-            .split('#')
-            .next()
-            .unwrap_or_default()
-            .split('?')
-            .next()
-            .unwrap_or_default()
-            .trim();
-        if !cleaned.is_empty() {
-            links.push(normalize_rel_path(cleaned));
-        }
-    }
-
-    tags.sort();
-    tags.dedup();
-    links.sort();
-    links.dedup();
-
-    FileCache {
-        headings,
-        tags,
-        links,
-    }
+    crate::markdown_syntax::extract_file_cache(text)
 }
 
 fn resolve_linkpath(
@@ -1572,7 +348,7 @@ fn resolve_linkpath(
     }
 
     let raw_has_ext = raw.to_ascii_lowercase().ends_with(".md");
-    let mut candidates = Vec::new();
+    let mut candidates: Vec<String> = Vec::new();
     candidates.push(if raw_has_ext {
         raw.clone()
     } else {
@@ -1617,178 +393,7 @@ fn resolve_linkpath(
 }
 
 fn build_metadata_cache(notes: &HashMap<String, String>, files: &[String]) -> MetadataCacheState {
-    let mut state = MetadataCacheState::default();
-    let mut file_lookup = HashMap::new();
-    let mut stem_lookup: HashMap<String, Vec<String>> = HashMap::new();
-
-    for path in files {
-        file_lookup.insert(path.to_ascii_lowercase(), path.clone());
-        let stem = Path::new(path)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or(path)
-            .to_ascii_lowercase();
-        stem_lookup.entry(stem).or_default().push(path.clone());
-
-        let text = notes.get(path).cloned().unwrap_or_default();
-        let cache = extract_file_cache(&text);
-        for tag in &cache.tags {
-            state
-                .tags_index
-                .entry(tag.clone())
-                .or_default()
-                .push(path.clone());
-        }
-        state.file_cache.insert(path.clone(), cache);
-    }
-
-    for path in files {
-        let cache = state.file_cache.get(path).cloned().unwrap_or_default();
-        for link in cache.links {
-            if let Some(target) = resolve_linkpath(&link, path, &file_lookup, &stem_lookup) {
-                let by_source = state.resolved_links.entry(path.clone()).or_default();
-                *by_source.entry(target.clone()).or_insert(0) += 1;
-                state
-                    .backlinks
-                    .entry(target)
-                    .or_default()
-                    .push(path.clone());
-            } else {
-                let by_source = state.unresolved_links.entry(path.clone()).or_default();
-                *by_source.entry(link).or_insert(0) += 1;
-            }
-        }
-    }
-
-    for files_for_tag in state.tags_index.values_mut() {
-        files_for_tag.sort();
-        files_for_tag.dedup();
-    }
-    for backlink_sources in state.backlinks.values_mut() {
-        backlink_sources.sort();
-        backlink_sources.dedup();
-    }
-
-    state
-}
-
-#[cfg(test)]
-mod markdown_syntax_tests {
-    use super::*;
-
-    fn assert_has(haystack: &str, needle: &str) {
-        assert!(
-            haystack.contains(needle),
-            "expected substring `{needle}` in:\n{haystack}"
-        );
-    }
-
-    #[test]
-    fn highlights_obsidian_inline_emphasis_variants() {
-        let html = highlight_inline(
-            "**bold** __bold2__ *it* _it2_ ~~gone~~ ==mark== ***both*** ___both2___",
-            None,
-            None,
-        );
-        assert_has(&html, "hl-bold");
-        assert_has(&html, "hl-italic");
-        assert_has(&html, "hl-strike");
-        assert_has(&html, "hl-mark");
-        assert_has(&html, "hl-bold hl-italic");
-    }
-
-    #[test]
-    fn highlights_obsidian_links_embeds_tags_and_blocks() {
-        let html = highlight_inline(
-            "[[Note]] ![[Asset.png]] [Label](Note.md) ![img](Img.png) #tag ^block-id",
-            None,
-            None,
-        );
-        assert_has(&html, "hl-link");
-        assert_has(&html, "hl-embed");
-        assert_has(&html, "hl-tag");
-        assert_has(&html, "hl-block-id");
-    }
-
-    #[test]
-    fn highlights_obsidian_comments_footnotes_and_math() {
-        let html = highlight_inline(
-            "%%comment%% Ref[^1] inline ^[note] and $e^{i\\pi}+1=0$",
-            None,
-            None,
-        );
-        assert_has(&html, "hl-comment");
-        assert_has(&html, "hl-footnote");
-        assert_has(&html, "hl-math-inline");
-    }
-
-    #[test]
-    fn highlights_headings_h1_to_h6() {
-        let html = highlight_markdown(
-            "# h1\n## h2\n### h3\n#### h4\n##### h5\n###### h6\n".trim_end_matches('\n'),
-            None,
-            None,
-        );
-        assert_has(&html, "hl-h1");
-        assert_has(&html, "hl-h2");
-        assert_has(&html, "hl-h3");
-        assert_has(&html, "hl-h4");
-        assert_has(&html, "hl-h5");
-        assert_has(&html, "hl-h6");
-    }
-
-    #[test]
-    fn highlights_callouts_lists_quotes_and_hr() {
-        let html = highlight_markdown(
-            "> [!note] Title\n> quote\n- [ ] task\n1) one\n- item\n---\n",
-            None,
-            None,
-        );
-        assert_has(&html, "hl-callout");
-        assert_has(&html, "hl-quote");
-        assert_has(&html, "hl-task");
-        assert_has(&html, "hl-list");
-        assert_has(&html, "hl-hr");
-    }
-
-    #[test]
-    fn highlights_tables_code_fences_math_blocks_frontmatter_and_comments() {
-        let html = highlight_markdown(
-            "---\ntitle: Bedrock\n---\n| a | b |\n| --- | --- |\n```rust\nlet x = 1;\n```\n$$\na+b\n$$\n%%\ncomment block\n%%\n",
-            None,
-            None,
-        );
-        assert_has(&html, "hl-frontmatter");
-        assert_has(&html, "hl-table");
-        assert_has(&html, "hl-codeblock");
-        assert_has(&html, "hl-code-fence");
-        assert_has(&html, "hl-math-block");
-        assert_has(&html, "hl-comment");
-    }
-
-    #[test]
-    fn highlights_footnote_definitions() {
-        let html = highlight_markdown("[^note]: footnote text\n", None, None);
-        assert_has(&html, "hl-footnote-def");
-    }
-
-    #[test]
-    fn metadata_extracts_wikilinks_and_markdown_links() {
-        let cache = extract_file_cache(
-            "[[Wiki Note]]\n[md](Folder/Note.md)\n![img](Image.png)\n[ext](https://example.com)\n",
-        );
-        assert!(cache.links.iter().any(|link| link == "Wiki Note"));
-        assert!(cache.links.iter().any(|link| link == "Folder/Note.md"));
-        assert!(cache.links.iter().any(|link| link == "Image.png"));
-        assert!(!cache.links.iter().any(|link| link.contains("https://")));
-    }
-
-    #[test]
-    fn inline_delimiters_respect_escaping() {
-        let html = highlight_inline(r"\*\*literal\*\* and **bold**", None, None);
-        assert_has(&html, "hl-bold");
-        assert_has(&html, r"\*\*literal\*\*");
-    }
+    crate::markdown_syntax::build_metadata_cache(notes, files)
 }
 
 #[component]
@@ -1798,6 +403,7 @@ pub fn App() -> impl IntoView {
     let (files, set_files) = signal(Vec::<String>::new());
     let (empty_dirs, set_empty_dirs) = signal(Vec::<String>::new());
     let (note_texts, set_note_texts) = signal(HashMap::<String, String>::new());
+    let (note_texts_lower, set_note_texts_lower) = signal(HashMap::<String, String>::new());
     let (metadata_cache, set_metadata_cache) = signal(MetadataCacheState::default());
 
     let (current_file, set_current_file) = signal(String::new());
@@ -1816,14 +422,35 @@ pub fn App() -> impl IntoView {
     let (settings, set_settings) = signal(AppSettings::default());
 
     let (save_timeout_id, set_save_timeout_id) = signal(Option::<i32>::None);
+    let (recent_notes_persist_timeout_id, set_recent_notes_persist_timeout_id) =
+        signal(Option::<i32>::None);
     let (save_status, set_save_status) = signal("Saved".to_string());
     let (show_markdown_syntax, set_show_markdown_syntax) = signal(false);
+    let (search_query, set_search_query) = signal(String::new());
     let (expanded_folders, set_expanded_folders) = signal(HashSet::<String>::new());
-    let (sidebar_context_menu, set_sidebar_context_menu) = signal(Option::<SidebarContextMenu>::None);
-    let (sidebar_tab, set_sidebar_tab) = signal("files".to_string());
-    let (recent_notes, set_recent_notes) = signal(Vec::<String>::new());
+    let (sidebar_context_menu, set_sidebar_context_menu) =
+        signal(Option::<SidebarContextMenu>::None);
+    let (sidebar_tab, set_sidebar_tab) = signal("search".to_string());
+    let (recent_notes, set_recent_notes) = signal(Vec::<RecentNoteEntry>::new());
     let (selection_restore_ticket, set_selection_restore_ticket) = signal(0u64);
     let (selection_sync_ticket, set_selection_sync_ticket) = signal(0u64);
+    let (undo_stack, set_undo_stack) = signal(Vec::<(String, Selection)>::new());
+    let (redo_stack, set_redo_stack) = signal(Vec::<(String, Selection)>::new());
+    let (vault_loaded, set_vault_loaded) = signal(false);
+    let (auto_recent_applied, set_auto_recent_applied) = signal(false);
+    // Track the last note the user explicitly opened so the Recent pane can
+    // still show it even if current_file is momentarily cleared by a race.
+    let (last_opened_file, set_last_opened_file) = signal(String::new());
+    // Ensure that when the Recent tab is opened after a full restart, we
+    // always perform at least one disk read to hydrate the list, even if
+    // earlier startup effects failed or were raced out.
+    let (recent_tab_disk_bootstrap_done, set_recent_tab_disk_bootstrap_done) =
+        signal(false);
+    // Track when we last persisted a non-empty recent list into the
+    // vault-session file so we can avoid redundant writes while still
+    // guaranteeing that at least one non-empty snapshot is available for
+    // session-based startup fallback across restarts.
+    let (last_persisted_recent_len, set_last_persisted_recent_len) = signal(0usize);
 
     let closure = Closure::<dyn FnMut(leptos::web_sys::CustomEvent)>::new(
         move |e: leptos::web_sys::CustomEvent| {
@@ -1834,22 +461,157 @@ pub fn App() -> impl IntoView {
             }
         },
     );
-    let _ = window()
-        .add_event_listener_with_callback("bedrock-settings", closure.as_ref().unchecked_ref());
-    closure.forget();
-
     let is_settings_window = window()
         .location()
         .search()
         .unwrap_or_default()
         .contains("settings=true");
+    let _ = window()
+        .add_event_listener_with_callback("bedrock-settings", closure.as_ref().unchecked_ref());
+    closure.forget();
+
+    if !is_settings_window {
+        let close_closure = Closure::<dyn FnMut(_)>::new(move |_e: Event| {
+            // Capture state synchronously first so index.html can persist even when
+            // requestAnimationFrame does not run (e.g. window closing in release webview).
+            let win = leptos::web_sys::window().expect("window");
+            {
+                if let Some(win_ref) = leptos::web_sys::window() {
+                    let v = vault_path.get_untracked();
+                    let r = recent_notes.get_untracked();
+                    let entries: Vec<RecentNoteEntry> = if r.is_empty() && !v.is_empty() {
+                        let open = current_file.get_untracked();
+                        let fallback = if !open.is_empty() {
+                            open
+                        } else {
+                            last_opened_file.get_untracked()
+                        };
+                        if !fallback.is_empty() {
+                            let title = fallback
+                                .rsplit('/')
+                                .next()
+                                .unwrap_or(&fallback)
+                                .to_string();
+                            vec![RecentNoteEntry {
+                                path: fallback,
+                                title,
+                                last_opened: Date::now() as i64,
+                            }]
+                        } else {
+                            r
+                        }
+                    } else {
+                        r
+                    };
+                    let state = Object::new();
+                    let _ = Reflect::set(
+                        &state,
+                        &JsValue::from_str("vault_path"),
+                        &JsValue::from_str(&v),
+                    );
+                    let entries_js =
+                        serde_wasm_bindgen::to_value(&entries).unwrap_or(JsValue::NULL);
+                    let _ = Reflect::set(&state, &JsValue::from_str("entries"), &entries_js);
+                    let current = current_file.get_untracked();
+                    if !current.is_empty() {
+                        let _ = Reflect::set(
+                            &state,
+                            &JsValue::from_str("current_file"),
+                            &JsValue::from_str(&current),
+                        );
+                    }
+                    let win_js: &JsValue = win_ref.as_ref();
+                    let _ = Reflect::set(
+                        win_js,
+                        &JsValue::from_str("__BEDROCK_STATE__"),
+                        &state,
+                    );
+                    if let Ok(ev) = Event::new("bedrock-state-saved") {
+                        let _ = win_ref.dispatch_event(&ev);
+                    }
+                }
+            }
+            // Optionally refine state after pending reactive updates (may not run on close).
+            let win2 = win.clone();
+            let frame_closure = Closure::once(move || {
+                let frame_closure2 = Closure::once(move || {
+                    if let Some(win_ref) = leptos::web_sys::window() {
+                        let v = vault_path.get_untracked();
+                        let r = recent_notes.get_untracked();
+                        let entries: Vec<RecentNoteEntry> = if r.is_empty() && !v.is_empty() {
+                            let open = current_file.get_untracked();
+                            let fallback = if !open.is_empty() {
+                                open
+                            } else {
+                                last_opened_file.get_untracked()
+                            };
+                            if !fallback.is_empty() {
+                                let title = fallback
+                                    .rsplit('/')
+                                    .next()
+                                    .unwrap_or(&fallback)
+                                    .to_string();
+                                vec![RecentNoteEntry {
+                                    path: fallback,
+                                    title,
+                                    last_opened: Date::now() as i64,
+                                }]
+                            } else {
+                                r
+                            }
+                        } else {
+                            r
+                        };
+                        let state = Object::new();
+                        let _ = Reflect::set(
+                            &state,
+                            &JsValue::from_str("vault_path"),
+                            &JsValue::from_str(&v),
+                        );
+                        let entries_js =
+                            serde_wasm_bindgen::to_value(&entries).unwrap_or(JsValue::NULL);
+                        let _ = Reflect::set(&state, &JsValue::from_str("entries"), &entries_js);
+                        let current = current_file.get_untracked();
+                        if !current.is_empty() {
+                            let _ = Reflect::set(
+                                &state,
+                                &JsValue::from_str("current_file"),
+                                &JsValue::from_str(&current),
+                            );
+                        }
+                        let win_js: &JsValue = win_ref.as_ref();
+                        let _ = Reflect::set(
+                            win_js,
+                            &JsValue::from_str("__BEDROCK_STATE__"),
+                            &state,
+                        );
+                        if let Ok(ev) = Event::new("bedrock-state-saved") {
+                            let _ = win_ref.dispatch_event(&ev);
+                        }
+                    }
+                });
+                let _ = win2.request_animation_frame(frame_closure2.as_ref().unchecked_ref());
+                frame_closure2.forget();
+            });
+            let _ = win.request_animation_frame(frame_closure.as_ref().unchecked_ref());
+            frame_closure.forget();
+        });
+        let _ = window().add_event_listener_with_callback(
+            "bedrock-save-state-and-close",
+            close_closure.as_ref().unchecked_ref(),
+        );
+        close_closure.forget();
+    }
 
     let clear_active_vault_state = move || {
         set_files.set(Vec::new());
         set_empty_dirs.set(Vec::new());
         set_note_texts.set(HashMap::new());
+        set_note_texts_lower.set(HashMap::new());
+        set_search_query.set(String::new());
         set_metadata_cache.set(MetadataCacheState::default());
         set_current_file.set(String::new());
+        set_last_opened_file.set(String::new());
         set_content.set(String::new());
         set_parsed_html.set(String::new());
         set_caret_pos.set(None);
@@ -1859,7 +621,11 @@ pub fn App() -> impl IntoView {
         set_image_preview_failed.set(HashSet::new());
         set_expanded_folders.set(HashSet::new());
         set_recent_notes.set(Vec::new());
+        set_undo_stack.set(Vec::new());
+        set_redo_stack.set(Vec::new());
         set_plugin_css.set(String::new());
+        set_vault_loaded.set(false);
+        set_auto_recent_applied.set(false);
     };
 
     let push_to_recent_notes = move |path: String| {
@@ -1871,18 +637,50 @@ pub fn App() -> impl IntoView {
             return;
         }
         set_recent_notes.update(|list| {
-            list.retain(|p| p != &path);
-            list.insert(0, path.clone());
+            let now = Date::now() as i64;
+            let title = path
+                .rsplit('/')
+                .next()
+                .unwrap_or(&path)
+                .to_string();
+            list.retain(|e| e.path != path);
+            list.insert(
+                0,
+                RecentNoteEntry {
+                    path: path.clone(),
+                    title,
+                    last_opened: now,
+                },
+            );
             if list.len() > 50 {
                 list.truncate(50);
             }
         });
         let list = recent_notes.get_untracked();
         let v = v_path.clone();
+        // Immediate persist so recent list survives quick close or crash.
         spawn_local(async move {
-            let args = serde_wasm_bindgen::to_value(&SaveRecentNotesArgs { vault_path: &v, paths: &list }).unwrap();
-            let _ = invoke("save_recent_notes", args).await;
+            tauri_bridge::cache_recent_notes(&v, &list).await;
         });
+        // Second persist after 150ms so we retry if the first invoke failed or was too late.
+        if let Some(win) = leptos::web_sys::window() {
+            let v2 = v_path.clone();
+            let recent_for_delay = recent_notes.clone();
+            let cb = Closure::once(move || {
+                let list2 = recent_for_delay.get_untracked();
+                if list2.is_empty() {
+                    return;
+                }
+                spawn_local(async move {
+                    tauri_bridge::cache_recent_notes(&v2, &list2).await;
+                });
+            });
+            let _ = win.set_timeout_with_callback_and_timeout_and_arguments_0(
+                cb.as_ref().unchecked_ref(),
+                150,
+            );
+            cb.forget();
+        }
     };
 
     let refresh_vault_snapshot = move |path: String, preferred_file: Option<String>| {
@@ -1891,33 +689,115 @@ pub fn App() -> impl IntoView {
             set_image_preview_loading.set(HashSet::new());
             set_image_preview_failed.set(HashSet::new());
 
-            let dir_args = serde_wasm_bindgen::to_value(&ReadDirArgs { path: &path }).unwrap();
-            let dir_val = invoke("read_dir", dir_args).await;
-            let dir_result =
-                serde_wasm_bindgen::from_value::<ReadDirResult>(dir_val).unwrap_or_else(|_| ReadDirResult { notes: Vec::new(), empty_dirs: Vec::new() });
-            if path != vault_path.get_untracked() {
+            let dir_result = tauri_bridge::read_dir(&path).await;
+            let current_vault = vault_path.get_untracked();
+            if collapse_path(&path) != collapse_path(&current_vault) {
                 return;
             }
+            set_vault_loaded.set(true);
             set_files.set(dir_result.notes.clone());
             set_empty_dirs.set(dir_result.empty_dirs.clone());
 
-            let recent_val = invoke("read_recent_notes", serde_wasm_bindgen::to_value(&path).unwrap()).await;
-            if path == vault_path.get_untracked() {
-                set_recent_notes.set(serde_wasm_bindgen::from_value::<Vec<String>>(recent_val).unwrap_or_default());
+            let mut loaded_recent = if collapse_path(&path) == collapse_path(&vault_path.get_untracked()) {
+                let mut l = tauri_bridge::read_recent_notes(&path).await;
+                l.sort_by(|a, b| b.last_opened.cmp(&a.last_opened));
+                // Prefer in-memory recent_notes when non-empty so a refresh (e.g. focus, watcher)
+                // doesn't overwrite with stale disk data before persist has completed.
+                let in_memory = recent_notes.get_untracked();
+                if !in_memory.is_empty() {
+                    let mut merged = in_memory.clone();
+                    merged.sort_by(|a, b| b.last_opened.cmp(&a.last_opened));
+                    set_recent_notes.set(merged.clone());
+                    merged
+                } else {
+                    // Re-read in-memory right before setting: user may have opened a note
+                    // after we read disk, so we must not overwrite with stale empty list.
+                    let now_memory = recent_notes.get_untracked();
+                    if !now_memory.is_empty() {
+                        let mut merged = now_memory.clone();
+                        merged.sort_by(|a, b| b.last_opened.cmp(&a.last_opened));
+                        set_recent_notes.set(merged.clone());
+                        merged
+                    } else {
+                        // Never show "No recent notes" when user has a file open: if disk is empty
+                        // but current_file is set and in this vault's files, ensure it's in the list.
+                        let mut list_to_set = l.clone();
+                        if list_to_set.is_empty() {
+                            let open_file = current_file.get_untracked();
+                            if !open_file.is_empty() && dir_result.notes.contains(&open_file) {
+                                let title = open_file
+                                    .rsplit('/')
+                                    .next()
+                                    .unwrap_or(&open_file)
+                                    .to_string();
+                                list_to_set.push(RecentNoteEntry {
+                                    path: open_file.clone(),
+                                    title,
+                                    last_opened: Date::now() as i64,
+                                });
+                            }
+                        }
+                        // Do not overwrite if user opened a note after we read now_memory (race).
+                        let right_before_set = recent_notes.get_untracked();
+                        if !right_before_set.is_empty() {
+                            let mut merged = right_before_set.clone();
+                            merged.sort_by(|a, b| b.last_opened.cmp(&a.last_opened));
+                            set_recent_notes.set(merged.clone());
+                            merged
+                        } else {
+                            set_recent_notes.set(list_to_set.clone());
+                            list_to_set
+                        }
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+
+            // Normalize recent note paths so they always match the current vault's note list.
+            // This handles older recent.json files that may store absolute paths instead of
+            // the relative paths used by collect_note_paths/read_dir.
+            if collapse_path(&path) == collapse_path(&vault_path.get_untracked()) && !loaded_recent.is_empty() {
+                let files_in_vault = dir_result.notes.clone();
+                let vault_prefix = format!("{}/", path);
+                let mut normalized: Vec<RecentNoteEntry> = Vec::new();
+
+                for mut entry in loaded_recent.iter().cloned() {
+                    if files_in_vault.contains(&entry.path) {
+                        normalized.push(entry);
+                        continue;
+                    }
+
+                    if entry.path.starts_with(&vault_prefix) {
+                        let rel = entry.path[vault_prefix.len()..].to_string();
+                        if files_in_vault.contains(&rel) {
+                            entry.path = rel;
+                            normalized.push(entry);
+                            continue;
+                        }
+                    }
+                }
+
+                if !normalized.is_empty() {
+                    set_recent_notes.set(normalized.clone());
+                    loaded_recent = normalized;
+                }
+                // If normalized is empty we keep loaded_recent as-is; UI already has it from set_recent_notes.set(l) above.
             }
 
-            let vault_args =
-                serde_wasm_bindgen::to_value(&VaultPathArgs { vault_path: &path }).unwrap();
-            let notes_val = invoke("read_vault_notes", vault_args).await;
-            let notes_list =
-                serde_wasm_bindgen::from_value::<Vec<VaultNote>>(notes_val).unwrap_or_default();
+            let notes_list = tauri_bridge::read_vault_notes(&path).await;
 
             let mut note_map = HashMap::new();
+            let mut lower_map = HashMap::new();
             for note in notes_list {
-                note_map.insert(note.path, note.content);
+                let path = note.path;
+                let content = note.content;
+                note_map.insert(path.clone(), content.clone());
+                lower_map.insert(path, content.to_lowercase());
             }
 
             set_note_texts.set(note_map.clone());
+            set_note_texts_lower.set(lower_map);
             let dir_list = &dir_result.notes;
             set_metadata_cache.set(build_metadata_cache(&note_map, dir_list));
 
@@ -1930,13 +810,51 @@ pub fn App() -> impl IntoView {
                     } else {
                         None
                     }
-                })
-                .or_else(|| dir_list.first().cloned());
+                });
 
             if let Some(selected_file) = next_file {
                 let text = note_map.get(&selected_file).cloned().unwrap_or_default();
                 set_current_file.set(selected_file.clone());
-                push_to_recent_notes(selected_file.clone());
+                set_recent_notes.update(|list| {
+                    let now = Date::now() as i64;
+                    let title = selected_file
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(&selected_file)
+                        .to_string();
+                    list.retain(|e| e.path != selected_file);
+                    list.insert(
+                        0,
+                        RecentNoteEntry {
+                            path: selected_file.clone(),
+                            title,
+                            last_opened: now,
+                        },
+                    );
+                    if list.len() > 50 {
+                        list.truncate(50);
+                    }
+                });
+                let now = Date::now() as i64;
+                let title = selected_file
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&selected_file)
+                    .to_string();
+                loaded_recent.retain(|e| e.path != selected_file);
+                loaded_recent.insert(
+                    0,
+                    RecentNoteEntry {
+                        path: selected_file.clone(),
+                        title,
+                        last_opened: now,
+                    },
+                );
+                if loaded_recent.len() > 50 {
+                    loaded_recent.truncate(50);
+                }
+                set_undo_stack.set(Vec::new());
+                set_redo_stack.set(Vec::new());
                 set_expanded_folders.update(|expanded| {
                     expand_parent_folders(expanded, &selected_file);
                 });
@@ -1951,11 +869,63 @@ pub fn App() -> impl IntoView {
                 set_caret_pos.set(None);
                 set_editor_snapshot.set(EditorSnapshot::new(text));
             } else {
-                set_current_file.set(String::new());
+                // Only clear current_file if it's no longer in the vault (e.g. deleted).
+                // If it's still in dir_list, keep it so the Recent pane and fallbacks still show it
+                // (avoids race where refresh completes after user opened a note but computed next_file earlier).
+                let open = current_file.get_untracked();
+                if open.is_empty() || !dir_list.contains(&open) {
+                    set_current_file.set(String::new());
+                }
                 set_content.set(String::new());
                 set_parsed_html.set(String::new());
                 set_caret_pos.set(None);
                 set_editor_snapshot.set(EditorSnapshot::new(String::new()));
+            }
+            if path == vault_path.get_untracked() {
+                // Final safeguard: ensure current_file is in recent list so we never persist
+                // a list that would show "No recent notes." when a note is open (e.g. race
+                // where refresh overwrote the optimistic push).
+                let open_file = current_file.get_untracked();
+                if !open_file.is_empty() && dir_list.contains(&open_file) {
+                    let in_memory_now = recent_notes.get_untracked();
+                    let has_open = in_memory_now.iter().any(|e| e.path == open_file);
+                    if !has_open {
+                        let title = open_file
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or(&open_file)
+                            .to_string();
+                        set_recent_notes.update(|list| {
+                            list.retain(|e| e.path != open_file);
+                            list.insert(
+                                0,
+                                RecentNoteEntry {
+                                    path: open_file.clone(),
+                                    title: title.clone(),
+                                    last_opened: Date::now() as i64,
+                                },
+                            );
+                            if list.len() > 50 {
+                                list.truncate(50);
+                            }
+                        });
+                        let mut fixed = loaded_recent.clone();
+                        fixed.retain(|e| e.path != open_file);
+                        fixed.insert(
+                            0,
+                            RecentNoteEntry {
+                                path: open_file.clone(),
+                                title,
+                                last_opened: Date::now() as i64,
+                            },
+                        );
+                        if fixed.len() > 50 {
+                            fixed.truncate(50);
+                        }
+                        loaded_recent = fixed;
+                    }
+                }
+                tauri_bridge::cache_recent_notes(&path, &loaded_recent).await;
             }
         });
     };
@@ -1966,18 +936,13 @@ pub fn App() -> impl IntoView {
             return;
         }
         spawn_local(async move {
-            let vault_args =
-                serde_wasm_bindgen::to_value(&VaultPathArgs { vault_path: &path }).unwrap();
-
-            let css_val = invoke("load_plugins_css", vault_args.clone()).await;
-            if let Some(css_str) = css_val.as_string() {
+            if let Some(css_str) = tauri_bridge::load_plugins_css(&path).await {
                 set_plugin_css.set(css_str);
             } else {
                 set_plugin_css.set(String::new());
             }
 
-            let s_val = invoke("load_settings", vault_args).await;
-            if let Some(s_str) = s_val.as_string() {
+            if let Some(s_str) = tauri_bridge::load_settings(&path).await {
                 if let Ok(s) = serde_json::from_str::<AppSettings>(&s_str) {
                     set_settings.set(s);
                 }
@@ -1988,25 +953,29 @@ pub fn App() -> impl IntoView {
     let persist_vault_session = move |open_list: Vec<String>, active: Option<String>| {
         let set_open = set_open_vaults;
         let set_active = set_vault_path;
-        spawn_local(async move {
-            let payload = Object::new();
-            let open_value = serde_wasm_bindgen::to_value(&open_list).unwrap_or(JsValue::NULL);
-            let active_value = active
-                .as_ref()
-                .map(|value| JsValue::from_str(value))
-                .unwrap_or(JsValue::NULL);
-
-            let _ = Reflect::set(&payload, &JsValue::from_str("open_vaults"), &open_value);
-            let _ = Reflect::set(&payload, &JsValue::from_str("openVaults"), &open_value);
-            let _ = Reflect::set(&payload, &JsValue::from_str("active_vault"), &active_value);
-            let _ = Reflect::set(&payload, &JsValue::from_str("activeVault"), &active_value);
-
-            let result = invoke("save_vault_session", payload.into()).await;
-            if let Ok(normalized) = serde_wasm_bindgen::from_value::<VaultSessionState>(result) {
-                set_open.set(normalized.open_vaults.clone());
-                if let Some(active_path) = normalized.active_vault {
-                    set_active.set(active_path);
+        // Pass current recent_notes for the active vault so session file persists the list.
+        let recent_for_active = active.as_ref().and_then(|a| {
+            if collapse_path(a) == collapse_path(&vault_path.get_untracked()) {
+                let r = recent_notes.get_untracked();
+                if r.is_empty() {
+                    None
+                } else {
+                    Some(r)
                 }
+            } else {
+                None
+            }
+        });
+        spawn_local(async move {
+            let normalized = tauri_bridge::save_vault_session(
+                &open_list,
+                active.as_deref(),
+                recent_for_active.as_deref(),
+            )
+            .await;
+            set_open.set(normalized.open_vaults.clone());
+            if let Some(active_path) = normalized.active_vault {
+                set_active.set(active_path);
             }
         });
     };
@@ -2022,6 +991,7 @@ pub fn App() -> impl IntoView {
         }
         set_open_vaults.set(open_now.clone());
         set_vault_path.set(path.clone());
+        set_vault_loaded.set(false);
         persist_vault_session(open_now, Some(path.clone()));
         refresh_vault_snapshot(path.clone(), preferred_file);
         load_vault_visual_state(path);
@@ -2029,11 +999,9 @@ pub fn App() -> impl IntoView {
 
     Effect::new(move |_| {
         spawn_local(async move {
-            let default_path = invoke("init_vault", JsValue::NULL).await.as_string();
+            let default_path = tauri_bridge::init_vault().await;
 
-            let session_val = invoke("load_vault_session", JsValue::NULL).await;
-            let mut session = serde_wasm_bindgen::from_value::<VaultSessionState>(session_val)
-                .unwrap_or_default();
+            let mut session = tauri_bridge::load_vault_session().await;
 
             let fallback = default_path.unwrap_or_default();
             if session.open_vaults.is_empty() && !fallback.is_empty() {
@@ -2069,7 +1037,106 @@ pub fn App() -> impl IntoView {
             set_open_vaults.set(session.open_vaults.clone());
 
             if let Some(path) = active.clone() {
-                activate_vault(path, None);
+                // If the session carried a recent-notes snapshot for this vault, restore
+                // it immediately so the Recent notes tab is populated on startup even
+                // before any async refresh completes.
+                if !session.recent_notes.is_empty() {
+                    let active_key = collapse_path(&path);
+                    // Try exact path key first, then collapse_path match (backend uses canonical paths).
+                    let list = session
+                        .recent_notes
+                        .get(&path)
+                        .cloned()
+                        .or_else(|| {
+                            session
+                                .recent_notes
+                                .iter()
+                                .find(|(k, _)| collapse_path(k) == active_key)
+                                .map(|(_, v)| v.clone())
+                        });
+                    if let Some(list) = list {
+                        if !list.is_empty() {
+                            set_recent_notes.set(list);
+                        }
+                    }
+                }
+                activate_vault(path.clone(), None);
+                // Always load recent notes from disk for the active vault at startup so
+                // persistence across restarts is guaranteed (disk is source of truth after launch).
+                let path_for_fallback = path.clone();
+                let set_recent_notes_fallback = set_recent_notes.clone();
+                spawn_local(async move {
+                    let list = tauri_bridge::read_recent_notes(&path_for_fallback).await;
+                    if !list.is_empty() {
+                        set_recent_notes_fallback.set(list);
+                    }
+                });
+                // Delayed fallback: if a late refresh overwrote the list with empty, re-apply from disk.
+                if let Some(win) = leptos::web_sys::window() {
+                    let path_delayed = path.clone();
+                    let set_delayed = set_recent_notes.clone();
+                    let recent_check = recent_notes.clone();
+                    let cb = Closure::once(move || {
+                        spawn_local(async move {
+                            let current = recent_check.get_untracked();
+                            if !current.is_empty() {
+                                return;
+                            }
+                            let list = tauri_bridge::read_recent_notes(&path_delayed).await;
+                            if !list.is_empty() {
+                                set_delayed.set(list);
+                            }
+                        });
+                    });
+                    let _ = win.set_timeout_with_callback_and_timeout_and_arguments_0(
+                        cb.as_ref().unchecked_ref(),
+                        400,
+                    );
+                    cb.forget();
+                    // Longer delayed fallback: if refresh runs after 400ms and overwrote with empty,
+                    // restore from disk again so persistence is visible after full restart.
+                    let path_delayed2 = path.clone();
+                    let set_delayed2 = set_recent_notes.clone();
+                    let recent_check2 = recent_notes.clone();
+                    let cb2 = Closure::once(move || {
+                        spawn_local(async move {
+                            let current = recent_check2.get_untracked();
+                            if !current.is_empty() {
+                                return;
+                            }
+                            let list = tauri_bridge::read_recent_notes(&path_delayed2).await;
+                            if !list.is_empty() {
+                                set_delayed2.set(list);
+                            }
+                        });
+                    });
+                    let _ = win.set_timeout_with_callback_and_timeout_and_arguments_0(
+                        cb2.as_ref().unchecked_ref(),
+                        1200,
+                    );
+                    cb2.forget();
+                    // Third fallback at 2500ms so persistence is visible even if refresh/race cleared the list late.
+                    let path_delayed3 = path.clone();
+                    let set_delayed3 = set_recent_notes.clone();
+                    let recent_check3 = recent_notes.clone();
+                    let cb3 = Closure::once(move || {
+                        spawn_local(async move {
+                            let current = recent_check3.get_untracked();
+                            if !current.is_empty() {
+                                return;
+                            }
+                            let list = tauri_bridge::read_recent_notes(&path_delayed3).await;
+                            if !list.is_empty() {
+                                set_delayed3.set(list);
+                            }
+                        });
+                    });
+                    let _ = win.set_timeout_with_callback_and_timeout_and_arguments_0(
+                        cb3.as_ref().unchecked_ref(),
+                        2500,
+                    );
+                    cb3.forget();
+                }
             } else {
                 set_vault_path.set(String::new());
                 clear_active_vault_state();
@@ -2077,6 +1144,132 @@ pub fn App() -> impl IntoView {
             }
             persist_vault_session(session.open_vaults.clone(), active.clone());
         });
+    });
+
+    Effect::new(move |_| {
+        if auto_recent_applied.get() {
+            return;
+        }
+        if vault_path.get().is_empty() || !vault_loaded.get() {
+            return;
+        }
+        if recent_notes.get().is_empty() {
+            return;
+        }
+        set_sidebar_tab.set("recent".to_string());
+        set_auto_recent_applied.set(true);
+    });
+
+    // Whenever the active vault has a non-empty recent list, persist it into
+    // the vault-session file so that load_vault_session can restore Recent
+    // notes across process restarts even if disk writes for `.bedrock/recent.json`
+    // were delayed or failed. We only persist when the list length changes to
+    // avoid tight feedback loops when save_vault_session normalizes state.
+    Effect::new(move |_| {
+        let v = vault_path.get();
+        let open_list = open_vaults.get();
+        let recents = recent_notes.get();
+        if v.is_empty() || open_list.is_empty() || recents.is_empty() {
+            return;
+        }
+        let current_len = recents.len();
+        if current_len == last_persisted_recent_len.get() {
+            return;
+        }
+        set_last_persisted_recent_len.set(current_len);
+        persist_vault_session(open_list.clone(), Some(v.clone()));
+    });
+
+    // When the user explicitly opens the Recent tab after a full restart,
+    // make a last-chance disk read to hydrate the list if it is still empty.
+    Effect::new(move |_| {
+        if recent_tab_disk_bootstrap_done.get() {
+            return;
+        }
+        if sidebar_tab.get() != "recent" {
+            return;
+        }
+        let v = vault_path.get();
+        if v.is_empty() {
+            return;
+        }
+        if !recent_notes.get().is_empty() {
+            set_recent_tab_disk_bootstrap_done.set(true);
+            return;
+        }
+        let path = v.clone();
+        let set_recent = set_recent_notes.clone();
+        set_recent_tab_disk_bootstrap_done.set(true);
+        spawn_local(async move {
+            let list = tauri_bridge::read_recent_notes(&path).await;
+            if !list.is_empty() {
+                set_recent.set(list);
+            }
+        });
+    });
+
+    Effect::new(move |_| {
+        let v = vault_path.get();
+        let mut r = recent_notes.get();
+        // When closing with an open note but an empty recent list, persist a
+        // single entry for the open note so the next launch can still show it
+        // in the Recent notes tab.
+        if r.is_empty() && !v.is_empty() {
+            let open = current_file.get_untracked();
+            if !open.is_empty() {
+                let title = open
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&open)
+                    .to_string();
+                r.push(RecentNoteEntry {
+                    path: open.clone(),
+                    title,
+                    last_opened: Date::now() as i64,
+                });
+            }
+        }
+        if let Some(win) = leptos::web_sys::window() {
+            let state = Object::new();
+            let _ = Reflect::set(
+                &state,
+                &JsValue::from_str("vault_path"),
+                &JsValue::from_str(&v),
+            );
+            let entries_js = serde_wasm_bindgen::to_value(&r).unwrap_or(JsValue::NULL);
+            let _ = Reflect::set(&state, &JsValue::from_str("entries"), &entries_js);
+            let win_js: &JsValue = win.as_ref();
+            let _ = Reflect::set(win_js, &JsValue::from_str("__BEDROCK_STATE__"), &state);
+        }
+    });
+
+    Effect::new(move |_| {
+        let v = vault_path.get();
+        let r = recent_notes.get();
+        if v.is_empty() || r.is_empty() {
+            return;
+        }
+        if let Some(win) = leptos::web_sys::window() {
+            if let Some(prev) = recent_notes_persist_timeout_id.get_untracked() {
+                win.clear_timeout_with_handle(prev);
+            }
+            let v_clone = v.clone();
+            let r_clone = r.clone();
+            let set_timeout = set_recent_notes_persist_timeout_id;
+            let cb = Closure::once(move || {
+                set_timeout.set(None);
+                spawn_local(async move {
+                    tauri_bridge::cache_recent_notes(&v_clone, &r_clone).await;
+                });
+            });
+            if let Ok(id) = win.set_timeout_with_callback_and_timeout_and_arguments_0(
+                cb.as_ref().unchecked_ref(),
+                100,
+            ) {
+                set_recent_notes_persist_timeout_id.set(Some(id));
+                cb.forget();
+            }
+        }
     });
 
     Effect::new(move |_| {
@@ -2130,10 +1323,7 @@ pub fn App() -> impl IntoView {
             let set_loading = set_image_preview_loading;
             let set_failed = set_image_preview_failed;
             spawn_local(async move {
-                let args =
-                    serde_wasm_bindgen::to_value(&ReadFileArgs { path: &image_path }).unwrap();
-                let value = invoke("read_file_base64", args).await;
-                if let Some(encoded) = value.as_string() {
+                if let Some(encoded) = tauri_bridge::read_file_base64(&image_path).await {
                     let src = format!(
                         "data:{};base64,{}",
                         image_mime_for_path(&image_path),
@@ -2179,12 +1369,7 @@ pub fn App() -> impl IntoView {
             let cb = Closure::once(move || {
                 set_timeout.set(None);
                 spawn_local(async move {
-                    let args = serde_wasm_bindgen::to_value(&WriteFileArgs {
-                        path: &file_path,
-                        content: &new_text,
-                    })
-                    .unwrap();
-                    invoke("write_file", args).await;
+                    tauri_bridge::write_file(&file_path, &new_text).await;
                     set_status.set("Saved".to_string());
                 });
             });
@@ -2210,10 +1395,19 @@ pub fn App() -> impl IntoView {
             if selection_restore_ticket.get_untracked() != expected_ticket {
                 return;
             }
-            if let Some(el) = eref.get() {
-                if let Ok(root) = el.dyn_into::<HtmlElement>() {
-                    set_selection_byte_offsets(&root, selection_to_restore);
+            let cb2 = Closure::once(move || {
+                if selection_restore_ticket.get_untracked() != expected_ticket {
+                    return;
                 }
+                if let Some(el) = eref.get() {
+                    if let Ok(root) = el.dyn_into::<HtmlElement>() {
+                        set_selection_byte_offsets(&root, selection_to_restore);
+                    }
+                }
+            });
+            if let Some(win) = leptos::web_sys::window() {
+                let _ = win.request_animation_frame(cb2.as_ref().unchecked_ref());
+                cb2.forget();
             }
         });
         if let Some(win) = leptos::web_sys::window() {
@@ -2246,9 +1440,18 @@ pub fn App() -> impl IntoView {
         schedule_selection_restore(selection);
     });
 
-    let apply_editor_update = move |new_text: String, sel_start: usize, sel_end: usize| {
-        set_composition_dirty.set(false);
+    let apply_editor_update = move |new_text: String, sel_start: usize, sel_end: usize, skip_undo: bool| {
         let mut snapshot = editor_snapshot.get_untracked();
+        if !skip_undo && snapshot.text != new_text {
+            set_undo_stack.update(|u| {
+                u.push((snapshot.text.clone(), snapshot.selection));
+                if u.len() > 100 {
+                    u.remove(0);
+                }
+            });
+            set_redo_stack.set(Vec::new());
+        }
+        set_composition_dirty.set(false);
         let selection = Selection::new(sel_start, sel_end);
         snapshot.replace_from_input(new_text, selection);
         let final_text = snapshot.text.clone();
@@ -2269,8 +1472,11 @@ pub fn App() -> impl IntoView {
         if !file.is_empty() {
             let mut notes = note_texts.get_untracked();
             notes.insert(file.clone(), final_text.clone());
+            let mut lower_notes = note_texts_lower.get_untracked();
+            lower_notes.insert(file.clone(), final_text.to_lowercase());
             let cache = build_metadata_cache(&notes, &files.get_untracked());
             set_note_texts.set(notes);
+            set_note_texts_lower.set(lower_notes);
             set_metadata_cache.set(cache);
             schedule_disk_write(file, final_text.clone());
         }
@@ -2289,10 +1495,28 @@ pub fn App() -> impl IntoView {
             set_composition_dirty.set(true);
         };
 
+    let schedule_focus_editor = move || {
+        let eref = editor_ref.clone();
+        if let Some(win) = leptos::web_sys::window() {
+            let cb = Closure::once(move || {
+                if let Some(el) = eref.get() {
+                    if let Ok(he) = el.dyn_into::<HtmlElement>() {
+                        let _ = he.focus();
+                    }
+                }
+            });
+            let _ = win.request_animation_frame(cb.as_ref().unchecked_ref());
+            cb.forget();
+        }
+    };
+
     let select_file = move |filename: String| {
         if let Some(text) = note_texts.get_untracked().get(&filename).cloned() {
             set_current_file.set(filename.clone());
+            set_last_opened_file.set(filename.clone());
             push_to_recent_notes(filename.clone());
+            set_undo_stack.set(Vec::new());
+            set_redo_stack.set(Vec::new());
             set_expanded_folders.update(|expanded| {
                 expand_parent_folders(expanded, &filename);
             });
@@ -2306,6 +1530,7 @@ pub fn App() -> impl IntoView {
             ));
             set_caret_pos.set(None);
             set_editor_snapshot.set(EditorSnapshot::new(text));
+            schedule_focus_editor();
             return;
         }
 
@@ -2313,13 +1538,18 @@ pub fn App() -> impl IntoView {
         if v_path.is_empty() {
             return;
         }
+        // Update Recent notes and current_file immediately so the list and fallbacks
+        // see the open note before async read completes and before any concurrent refresh.
+        set_current_file.set(filename.clone());
+        set_last_opened_file.set(filename.clone());
+        push_to_recent_notes(filename.clone());
         spawn_local(async move {
             let file_path = format!("{}/{}", v_path, filename);
-            let args = serde_wasm_bindgen::to_value(&ReadFileArgs { path: &file_path }).unwrap();
-            let text_val = invoke("read_file", args).await;
-            if let Some(text) = text_val.as_string() {
+            if let Some(text) = tauri_bridge::read_file(&file_path).await {
                 set_current_file.set(filename.clone());
                 push_to_recent_notes(filename.clone());
+                set_undo_stack.set(Vec::new());
+                set_redo_stack.set(Vec::new());
                 set_expanded_folders.update(|expanded| {
                     expand_parent_folders(expanded, &filename);
                 });
@@ -2335,12 +1565,44 @@ pub fn App() -> impl IntoView {
                 set_editor_snapshot.set(EditorSnapshot::new(text.clone()));
 
                 let mut notes = note_texts.get_untracked();
-                notes.insert(filename.clone(), text);
+                notes.insert(filename.clone(), text.clone());
+                let mut lower_notes = note_texts_lower.get_untracked();
+                lower_notes.insert(filename.clone(), text.to_lowercase());
                 set_metadata_cache.set(build_metadata_cache(&notes, &files.get_untracked()));
                 set_note_texts.set(notes);
+                set_note_texts_lower.set(lower_notes);
+
+                let eref = editor_ref.clone();
+                if let Some(win) = leptos::web_sys::window() {
+                    let cb = Closure::once(move || {
+                        if let Some(el) = eref.get() {
+                            if let Ok(he) = el.dyn_into::<HtmlElement>() {
+                                let _ = he.focus();
+                            }
+                        }
+                    });
+                    let _ = win.request_animation_frame(cb.as_ref().unchecked_ref());
+                    cb.forget();
+                }
             }
         });
     };
+
+    Effect::new(move |_| {
+        let Some(win) = leptos::web_sys::window() else { return };
+        let Some(doc) = win.document() else { return };
+        let handler = Closure::wrap(Box::new(move |e: KeyboardEvent| {
+            if (e.meta_key() || e.ctrl_key()) && e.key() == "1" {
+                e.prevent_default();
+                let list = files.get_untracked();
+                if let Some(first) = list.first() {
+                    select_file(first.clone());
+                }
+            }
+        }) as Box<dyn FnMut(KeyboardEvent)>);
+        let _ = doc.add_event_listener_with_callback("keydown", handler.as_ref().unchecked_ref());
+        handler.forget();
+    });
 
     let schedule_selection_sync = move || {
         let next_ticket = selection_sync_ticket.get_untracked().wrapping_add(1);
@@ -2356,22 +1618,24 @@ pub fn App() -> impl IntoView {
             let Ok(root) = el.dyn_into::<HtmlElement>() else {
                 return;
             };
-            let text = root.inner_text();
+            let text = root.text_content().unwrap_or_default();
             if let Some(selection) = get_selection_byte_offsets(&root).map(|s| s.clamp(text.len()))
             {
                 let mut snapshot = editor_snapshot.get_untracked();
-                snapshot.set_selection(selection);
-                set_editor_snapshot.set(snapshot);
-                set_caret_pos.set(Some(selection.start));
-                if !is_composing.get_untracked() {
-                    set_parsed_html.set(highlight_markdown_for_editor(
-                        &text,
-                        Some(selection.start),
-                        &vault_path.get_untracked(),
-                        &current_file.get_untracked(),
-                        &image_preview_cache.get_untracked(),
-                    ));
-                    schedule_selection_restore(selection);
+                if snapshot.selection != selection {
+                    snapshot.set_selection(selection);
+                    set_editor_snapshot.set(snapshot);
+                    set_caret_pos.set(Some(selection.start));
+                    if !is_composing.get_untracked() {
+                        set_parsed_html.set(highlight_markdown_for_editor(
+                            &text,
+                            Some(selection.start),
+                            &vault_path.get_untracked(),
+                            &current_file.get_untracked(),
+                            &image_preview_cache.get_untracked(),
+                        ));
+                        schedule_selection_restore(selection);
+                    }
                 }
             }
         });
@@ -2386,7 +1650,7 @@ pub fn App() -> impl IntoView {
         let new_text = target
             .dyn_into::<HtmlElement>()
             .ok()
-            .map(|el| el.inner_text())
+            .and_then(|el| el.text_content())
             .unwrap_or_default();
         let selection = editor_ref
             .get()
@@ -2398,7 +1662,7 @@ pub fn App() -> impl IntoView {
         if is_composing.get_untracked() {
             apply_composition_shadow_update(new_text, selection.start, selection.end);
         } else {
-            apply_editor_update(new_text, selection.start, selection.end);
+            apply_editor_update(new_text, selection.start, selection.end, false);
         }
     };
 
@@ -2413,20 +1677,49 @@ pub fn App() -> impl IntoView {
             return;
         };
 
-        let text = root.inner_text();
-        let selection = get_selection_byte_offsets(&root)
-            .unwrap_or_else(|| Selection::cursor(text.len()))
-            .clamp(text.len());
+        let text = root.text_content().unwrap_or_default();
+        let (selection, did_collapse) = get_selection_byte_offsets_with_collapsed(&root)
+            .map(|(s, c)| (s.clamp(text.len()), c))
+            .unwrap_or_else(|| (Selection::cursor(text.len()), false));
 
         let mut snapshot = editor_snapshot.get_untracked();
         snapshot.replace_from_input(text.clone(), selection);
         set_editor_snapshot.set(snapshot.clone());
 
         let key = e.key();
+        if did_collapse && (key == "ArrowUp" || key == "ArrowDown") {
+            return;
+        }
+
         let ctrl_or_cmd = e.ctrl_key() || e.meta_key();
 
         if ctrl_or_cmd && !e.alt_key() {
             match key.as_str() {
+                "z" | "Z" => {
+                    if e.shift_key() {
+                        if let Some((text, sel)) = redo_stack.get_untracked().last().cloned() {
+                            set_redo_stack.update(|r| { r.pop(); });
+                            set_undo_stack.update(|u| {
+                                u.push((snapshot.text.clone(), snapshot.selection));
+                                if u.len() > 100 { u.remove(0); }
+                            });
+                            apply_editor_update(text, sel.start, sel.end, true);
+                            e.prevent_default();
+                            return;
+                        }
+                    } else {
+                        if let Some((text, sel)) = undo_stack.get_untracked().last().cloned() {
+                            set_undo_stack.update(|u| { u.pop(); });
+                            set_redo_stack.update(|r| {
+                                r.push((snapshot.text.clone(), snapshot.selection));
+                                if r.len() > 100 { r.remove(0); }
+                            });
+                            apply_editor_update(text, sel.start, sel.end, true);
+                            e.prevent_default();
+                            return;
+                        }
+                    }
+                }
                 "b" | "B" => {
                     if apply_markdown_command(
                         &mut snapshot,
@@ -2443,6 +1736,7 @@ pub fn App() -> impl IntoView {
                             snapshot.text.clone(),
                             snapshot.selection.start,
                             snapshot.selection.end,
+                            false,
                         );
                         return;
                     }
@@ -2463,6 +1757,7 @@ pub fn App() -> impl IntoView {
                             snapshot.text.clone(),
                             snapshot.selection.start,
                             snapshot.selection.end,
+                            false,
                         );
                         return;
                     }
@@ -2483,6 +1778,7 @@ pub fn App() -> impl IntoView {
                             snapshot.text.clone(),
                             snapshot.selection.start,
                             snapshot.selection.end,
+                            false,
                         );
                         return;
                     }
@@ -2503,6 +1799,7 @@ pub fn App() -> impl IntoView {
                     snapshot.text.clone(),
                     snapshot.selection.start,
                     snapshot.selection.end,
+                    false,
                 );
             }
             return;
@@ -2517,6 +1814,7 @@ pub fn App() -> impl IntoView {
                     snapshot.text.clone(),
                     snapshot.selection.start,
                     snapshot.selection.end,
+                    false,
                 );
                 return;
             }
@@ -2532,6 +1830,7 @@ pub fn App() -> impl IntoView {
                     snapshot.text.clone(),
                     snapshot.selection.start,
                     snapshot.selection.end,
+                    false,
                 );
             }
             return;
@@ -2557,6 +1856,7 @@ pub fn App() -> impl IntoView {
                         snapshot.text.clone(),
                         snapshot.selection.start,
                         snapshot.selection.end,
+                        false,
                     );
                 }
             }
@@ -2585,7 +1885,7 @@ pub fn App() -> impl IntoView {
             return;
         };
 
-        let text = root.inner_text();
+        let text = root.text_content().unwrap_or_default();
         let selection = get_selection_byte_offsets(&root)
             .unwrap_or_else(|| Selection::cursor(text.len()))
             .clamp(text.len());
@@ -2608,6 +1908,7 @@ pub fn App() -> impl IntoView {
                 snapshot.text.clone(),
                 snapshot.selection.start,
                 snapshot.selection.end,
+                false,
             );
         }
     };
@@ -2628,12 +1929,12 @@ pub fn App() -> impl IntoView {
         let Ok(root) = el.dyn_into::<HtmlElement>() else {
             return;
         };
-        let text = root.inner_text();
+        let text = root.text_content().unwrap_or_default();
         let selection = get_selection_byte_offsets(&root)
             .unwrap_or_else(|| Selection::cursor(text.len()))
             .clamp(text.len());
         set_composition_dirty.set(false);
-        apply_editor_update(text, selection.start, selection.end);
+        apply_editor_update(text, selection.start, selection.end, false);
     };
 
     let run_editor_action = move |action: &'static str| {
@@ -2644,7 +1945,7 @@ pub fn App() -> impl IntoView {
             return;
         };
 
-        let text = root.inner_text();
+        let text = root.text_content().unwrap_or_default();
         let selection = get_selection_byte_offsets(&root)
             .unwrap_or_else(|| Selection::cursor(text.len()))
             .clamp(text.len());
@@ -2689,6 +1990,7 @@ pub fn App() -> impl IntoView {
                 snapshot.text.clone(),
                 snapshot.selection.start,
                 snapshot.selection.end,
+                false,
             );
         }
     };
@@ -2698,16 +2000,9 @@ pub fn App() -> impl IntoView {
         if v_path.is_empty() {
             return;
         }
-        if let Ok(s_json) = serde_json::to_string(&s) {
-            spawn_local(async move {
-                let args = serde_wasm_bindgen::to_value(&SaveSettingsArgs {
-                    vault_path: &v_path,
-                    settings: &s_json,
-                })
-                .unwrap();
-                invoke("save_settings", args).await;
-            });
-        }
+        spawn_local(async move {
+            tauri_bridge::save_settings(&v_path, &s).await;
+        });
     };
 
     let create_new_note = move || {
@@ -2732,12 +2027,7 @@ pub fn App() -> impl IntoView {
             let file_for_refresh = filename.clone();
 
             spawn_local(async move {
-                let args = serde_wasm_bindgen::to_value(&WriteFileArgs {
-                    path: &file_path,
-                    content: &initial,
-                })
-                .unwrap();
-                invoke("write_file", args).await;
+                tauri_bridge::write_file(&file_path, &initial).await;
                 refresh_vault_snapshot(path_for_refresh, Some(file_for_refresh));
             });
         }
@@ -2764,12 +2054,7 @@ pub fn App() -> impl IntoView {
                 expand_parent_folders(expanded, &filename);
             });
             spawn_local(async move {
-                let args = serde_wasm_bindgen::to_value(&WriteFileArgs {
-                    path: &file_path,
-                    content: &initial,
-                })
-                .unwrap();
-                invoke("write_file", args).await;
+                tauri_bridge::write_file(&file_path, &initial).await;
                 refresh_vault_snapshot(path_for_refresh, Some(file_for_refresh));
             });
         }
@@ -2794,8 +2079,7 @@ pub fn App() -> impl IntoView {
             };
             let path_for_refresh = v_path.clone();
             spawn_local(async move {
-                let args = serde_wasm_bindgen::to_value(&ReadFileArgs { path: &full_path }).unwrap();
-                let _ = invoke("create_dir", args).await;
+                tauri_bridge::create_dir(&full_path).await;
                 refresh_vault_snapshot(path_for_refresh, None);
             });
         }
@@ -2811,8 +2095,7 @@ pub fn App() -> impl IntoView {
         let path_for_refresh = v_path.clone();
         let next_file = if current_file.get_untracked() == file_path { None } else { Some(current_file.get_untracked().clone()) };
         spawn_local(async move {
-            let args = serde_wasm_bindgen::to_value(&ReadFileArgs { path: &full_path }).unwrap();
-            let _ = invoke("delete_file", args).await;
+            tauri_bridge::delete_file(&full_path).await;
             refresh_vault_snapshot(path_for_refresh, next_file);
         });
     };
@@ -2832,8 +2115,7 @@ pub fn App() -> impl IntoView {
             None
         };
         spawn_local(async move {
-            let args = serde_wasm_bindgen::to_value(&ReadFileArgs { path: &full_path }).unwrap();
-            let _ = invoke("delete_dir", args).await;
+            tauri_bridge::delete_dir(&full_path).await;
             refresh_vault_snapshot(path_for_refresh, next_file);
         });
     };
@@ -2863,14 +2145,8 @@ pub fn App() -> impl IntoView {
             let old_for_api = old_name.clone();
             let next_for_api = final_name.clone();
             spawn_local(async move {
-                let args = serde_wasm_bindgen::to_value(&RenameNoteArgs {
-                    vault_path: &v_path,
-                    old_path: &old_for_api,
-                    new_path: &next_for_api,
-                })
-                .unwrap();
-                let result = invoke("rename_note", args).await;
-                let selected = result.as_string().unwrap_or(next_for_api);
+                let selected =
+                    tauri_bridge::rename_note(&v_path, &old_for_api, &next_for_api).await;
                 refresh_vault_snapshot(path_for_refresh, Some(selected));
             });
         }
@@ -2878,8 +2154,7 @@ pub fn App() -> impl IntoView {
 
     let import_from_obsidian_vault = move || {
         spawn_local(async move {
-            let result = invoke("import_obsidian_vault_with_picker", JsValue::NULL).await;
-            let Ok(report) = serde_wasm_bindgen::from_value::<VaultImportReport>(result) else {
+            let Some(report) = tauri_bridge::import_obsidian_vault_with_picker().await else {
                 let _ = window()
                     .alert_with_message("Import failed: backend returned an invalid response.");
                 return;
@@ -2916,11 +2191,7 @@ pub fn App() -> impl IntoView {
 
     let open_bedrock_vault = move || {
         spawn_local(async move {
-            let result = invoke("pick_bedrock_vault", JsValue::NULL).await;
-            let picked = serde_wasm_bindgen::from_value::<Option<String>>(result)
-                .ok()
-                .flatten();
-            let Some(path) = picked else {
+            let Some(path) = tauri_bridge::pick_bedrock_vault().await else {
                 return;
             };
             activate_vault(path, None);
@@ -3058,326 +2329,61 @@ pub fn App() -> impl IntoView {
             .into_any()
         } else {
             view! {
-                <nav class="sidebar" style="width: var(--sidebar-width); border-right: 1px solid var(--border-color); display: flex; flex-direction: column; background: var(--bg-secondary); transition: all 0.3s ease;">
-                    <div class="sidebar-header" style="display: flex; flex-direction: column; gap: 0.5rem; padding: 0.65rem 0.75rem; border-bottom: 1px solid var(--border-color);">
-                        <div style="display: flex; align-items: center; justify-content: space-between; gap: 0.5rem;">
-                            <span style="font-weight: 700; color: var(--accent-color);">"Bedrock"</span>
-                            <div style="display: flex; gap: 0.3rem; align-items: center;">
-                                <button
-                                    on:click=move |_| open_bedrock_vault()
-                                    style="background: transparent; border: none; font-size: 0.95rem; cursor: pointer; color: var(--text-muted);"
-                                    title="Open or add a vault"
-                                >
-                                    "🗂"
-                                </button>
-                                <button
-                                    on:click=move |_| close_current_vault()
-                                    style="background: transparent; border: none; font-size: 0.95rem; cursor: pointer; color: var(--text-muted);"
-                                    title="Close current vault"
-                                >
-                                    "✕"
-                                </button>
-                                <button
-                                    on:click=move |_| create_new_note()
-                                    style="background: transparent; border: none; font-size: 1.1rem; cursor: pointer; color: var(--text-muted);"
-                                    title="New note"
-                                >
-                                    "+"
-                                </button>
-                                <button
-                                    on:click=move |_| import_from_obsidian_vault()
-                                    style="background: transparent; border: none; font-size: 1rem; cursor: pointer; color: var(--text-muted);"
-                                    title="Import from Obsidian vault"
-                                >
-                                    "⇪"
-                                </button>
-                                <button
-                                    on:click=move |_| {
-                                        spawn_local(async move {
-                                            invoke("open_settings_window", JsValue::NULL).await;
-                                        });
-                                    }
-                                    style="background: transparent; border: none; font-size: 1.1rem; cursor: pointer; color: var(--text-muted);"
-                                    title="Settings"
-                                >
-                                    "⚙"
-                                </button>
-                            </div>
-                        </div>
-                        <div style="display: flex; flex-direction: column; gap: 0.25rem;">
-                            <select
-                                style="width: 100%; font-size: 0.78rem; padding: 0.2rem 0.35rem; border-radius: var(--radius-sm); border: 1px solid var(--border-color); background: var(--bg-primary); color: var(--text-primary);"
-                                prop:value=move || vault_path.get()
-                                on:change=move |e| switch_to_vault(event_target_value(&e))
-                            >
-                                {move || {
-                                    let vaults = open_vaults.get();
-                                    if vaults.is_empty() {
-                                        vec![view! { <option value=String::new()>{"No open vaults".to_string()}</option> }]
-                                    } else {
-                                        vaults
-                                            .into_iter()
-                                            .map(|path| {
-                                                let label = vault_display_name(&path);
-                                                view! { <option value=path.clone()>{label}</option> }
-                                            })
-                                            .collect::<Vec<_>>()
-                                    }
-                                }}
-                            </select>
-                            <span
-                                style="font-size: 0.72rem; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;"
-                                title=move || vault_path.get()
-                            >
-                                {move || {
-                                    let path = vault_path.get();
-                                    if path.is_empty() {
-                                        "No active vault".to_string()
-                                    } else {
-                                        format!("Active: {}", vault_display_name(&path))
-                                    }
-                                }}
-                            </span>
-                        </div>
-                    </div>
-                    <div style="display: flex; gap: 0; border-bottom: 1px solid var(--border-color); padding: 0 0.5rem;">
-                        <button
-                            style=move || format!("flex: 1; padding: 0.4rem 0.5rem; font-size: 0.8rem; border: none; border-radius: 0; background: transparent; color: {}; border-bottom: 2px solid {};",
-                                if sidebar_tab.get() == "files" { "var(--accent-color)" } else { "var(--text-muted)" },
-                                if sidebar_tab.get() == "files" { "var(--accent-color)" } else { "transparent" }
-                            )
-                            on:click=move |_| set_sidebar_tab.set("files".to_string())
-                        >
-                            "Files"
-                        </button>
-                        <button
-                            style=move || format!("flex: 1; padding: 0.4rem 0.5rem; font-size: 0.8rem; border: none; border-radius: 0; background: transparent; color: {}; border-bottom: 2px solid {};",
-                                if sidebar_tab.get() == "recent" { "var(--accent-color)" } else { "var(--text-muted)" },
-                                if sidebar_tab.get() == "recent" { "var(--accent-color)" } else { "transparent" }
-                            )
-                            on:click=move |_| set_sidebar_tab.set("recent".to_string())
-                        >
-                            "Recent"
-                        </button>
-                    </div>
-                    <div class="file-list" style="flex: 1; overflow-y: auto; padding: 0.75rem 0.5rem;">
-                        {move || {
-                            let tab = sidebar_tab.get();
-                            if tab == "recent" {
-                                let recent = recent_notes.get();
-                                let files_in_vault = files.get();
-                                let valid: Vec<_> = recent.into_iter().filter(|p| files_in_vault.contains(p)).collect();
-                                if valid.is_empty() {
-                                    return view! {
-                                        <div style="padding: 0.5rem 0.75rem; font-size: 0.82rem; color: var(--text-muted);">
-                                            "No recent notes."
-                                        </div>
-                                    }.into_any();
-                                }
-                                return view! {
-                                    <>
-                                        {valid.into_iter().map(|path| {
-                                            let filename = path.clone();
-                                            let active_path = path.clone();
-                                            let name = path.rsplit('/').next().unwrap_or(&path).to_string();
-                                            let is_active = move || current_file.get() == active_path;
-                                            view! {
-                                                <div
-                                                    style=move || format!(
-                                                        "padding: 0.38rem 0.65rem 0.38rem 1.5rem; cursor: pointer; border-radius: var(--radius-md); margin-bottom: 2px; font-size: 0.84rem; transition: background 0.2s, color 0.2s; {}",
-                                                        if is_active() { "background: var(--accent-color); color: white;" } else { "color: var(--text-secondary);" }
-                                                    )
-                                                    on:click=move |_| select_file(filename.clone())
-                                                    title=path.clone()
-                                                >
-                                                    {name}
-                                                </div>
-                                            }
-                                        }).collect::<Vec<_>>()}
-                                    </>
-                                }.into_any();
-                            }
-
-                            let files_in_vault = files.get();
-                            if files_in_vault.is_empty() {
-                                let msg = if vault_path.get().is_empty() {
-                                    "Open a Bedrock vault to see notes."
-                                } else {
-                                    "No markdown notes in this vault."
-                                };
-                                return view! {
-                                    <div style="padding: 0.5rem 0.75rem; font-size: 0.82rem; color: var(--text-muted);">
-                                        {msg}
-                                    </div>
-                                }.into_any();
-                            }
-
-                            let mut tree = build_file_tree(&files_in_vault);
-                            add_empty_dirs_to_tree(&mut tree, &empty_dirs.get());
-                            let rows = build_sidebar_entries(&tree, &expanded_folders.get());
-
-                            view! {
-                                <>
-                                    {rows.into_iter().map(|row| {
-                                        match row {
-                                            SidebarEntry::Folder { path, name, depth, note_count, expanded } => {
-                                                let toggle_path = path.clone();
-                                                let context_path = path.clone();
-                                                let indent = 0.45 + (depth as f32 * 0.95);
-                                                let chevron = if expanded { "▾" } else { "▸" };
-                                                let row_bg = if expanded {
-                                                    "background: color-mix(in srgb, var(--accent-color) 11%, transparent);"
-                                                } else {
-                                                    ""
-                                                };
-
-                                                view! {
-                                                    <div
-                                                        class="folder-item"
-                                                        style=format!(
-                                                            "display: flex; align-items: center; gap: 0.4rem; padding: 0.34rem 0.5rem 0.34rem {indent}rem; cursor: pointer; border-radius: var(--radius-md); margin-bottom: 2px; font-size: 0.82rem; color: var(--text-secondary); transition: background 0.15s ease; {row_bg}"
-                                                        )
-                                                        on:click=move |_| {
-                                                            set_expanded_folders.update(|expanded_set| {
-                                                                if expanded_set.contains(&toggle_path) {
-                                                                    expanded_set.remove(&toggle_path);
-                                                                } else {
-                                                                    expanded_set.insert(toggle_path.clone());
-                                                                }
-                                                            });
-                                                        }
-                                                        on:contextmenu=move |ev: leptos::ev::MouseEvent| {
-                                                            ev.prevent_default();
-                                                            set_sidebar_context_menu.set(Some(SidebarContextMenu::Folder { path: context_path.clone(), x: ev.client_x() as f64, y: ev.client_y() as f64 }));
-                                                        }
-                                                        title=path
-                                                    >
-                                                        <span style="width: 0.8rem; text-align: center; color: var(--text-muted);">{chevron}</span>
-                                                        <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{name}</span>
-                                                        <span style="margin-left: auto; font-size: 0.72rem; color: var(--text-muted);">{note_count.to_string()}</span>
-                                                    </div>
-                                                }.into_any()
-                                            }
-                                            SidebarEntry::File { path, name, depth } => {
-                                                let filename = path.clone();
-                                                let active_path = path.clone();
-                                                let context_file_path = path.clone();
-                                                let is_active = move || current_file.get() == active_path;
-                                                let indent = 1.5 + (depth as f32 * 0.95);
-
-                                                view! {
-                                                    <div
-                                                        class="file-item"
-                                                        style=move || format!(
-                                                            "padding: 0.38rem 0.65rem 0.38rem {indent}rem; cursor: pointer; border-radius: var(--radius-md); margin-bottom: 2px; font-size: 0.84rem; transition: background 0.2s, color 0.2s; {}",
-                                                            if is_active() { "background: var(--accent-color); color: white;" } else { "color: var(--text-secondary);" }
-                                                        )
-                                                        on:click=move |_| select_file(filename.clone())
-                                                        on:contextmenu=move |ev: leptos::ev::MouseEvent| {
-                                                            ev.prevent_default();
-                                                            set_sidebar_context_menu.set(Some(SidebarContextMenu::File { path: context_file_path.clone(), x: ev.client_x() as f64, y: ev.client_y() as f64 }));
-                                                        }
-                                                        title=path
-                                                    >
-                                                        {name}
-                                                    </div>
-                                                }.into_any()
-                                            }
-                                        }
-                                    }).collect::<Vec<_>>()}
-                                </>
-                            }.into_any()
-                        }}
-                    </div>
-                </nav>
-                {move || match sidebar_context_menu.get() {
-                    Some(SidebarContextMenu::Folder { path, x, y }) => {
-                        let path_for_note = path.clone();
-                        let path_for_folder = path.clone();
-                        let path_for_delete = path.clone();
-                        view! {
-                            <div
-                                style="position: fixed; inset: 0; z-index: 1000;"
-                                on:click=move |_| set_sidebar_context_menu.set(None)
-                            >
-                                <div
-                                    style=format!("position: absolute; left: {}px; top: {}px; background: var(--bg-secondary); border: 1px solid var(--border-color); border-radius: var(--radius-md); padding: 0.25rem 0; box-shadow: 0 4px 12px rgba(0,0,0,0.15); min-width: 8rem;", x, y)
-                                    on:click=move |ev| ev.stop_propagation()
-                                >
-                                    <button
-                                        style="display: block; width: 100%; padding: 0.4rem 0.75rem; text-align: left; font-size: 0.85rem; background: transparent; border: none; cursor: pointer; color: var(--text-primary);"
-                                        on:click=move |_| create_note_in_folder(path_for_note.clone())
-                                    >
-                                        "New note"
-                                    </button>
-                                    <button
-                                        style="display: block; width: 100%; padding: 0.4rem 0.75rem; text-align: left; font-size: 0.85rem; background: transparent; border: none; cursor: pointer; color: var(--text-primary);"
-                                        on:click=move |_| create_folder_in_folder(path_for_folder.clone())
-                                    >
-                                        "New folder"
-                                    </button>
-                                    <button
-                                        style="display: block; width: 100%; padding: 0.4rem 0.75rem; text-align: left; font-size: 0.85rem; background: transparent; border: none; cursor: pointer; color: var(--text-primary);"
-                                        on:click=move |_| delete_folder(path_for_delete.clone())
-                                    >
-                                        "Delete folder"
-                                    </button>
-                                </div>
-                            </div>
-                        }.into_any()
+                <SidebarPanel
+                    vault_path=vault_path
+                    open_vaults=open_vaults
+                    sidebar_tab=sidebar_tab
+                    set_sidebar_tab=set_sidebar_tab
+                    files=files
+                    empty_dirs=empty_dirs
+                    expanded_folders=expanded_folders
+                    set_expanded_folders=set_expanded_folders
+                    sidebar_context_menu=sidebar_context_menu
+                    set_sidebar_context_menu=set_sidebar_context_menu
+                    current_file=current_file
+                    last_opened_file=last_opened_file
+                    recent_notes=recent_notes
+                    note_texts=note_texts
+                    note_texts_lower=note_texts_lower
+                    search_query=search_query
+                    set_search_query=set_search_query
+                    on_open_vault=move || open_bedrock_vault()
+                    on_close_vault=move || close_current_vault()
+                    on_new_note=move || create_new_note()
+                    on_import_obsidian=move || import_from_obsidian_vault()
+                    on_open_settings=move || {
+                        spawn_local(async move {
+                            tauri_bridge::open_settings_window().await;
+                        });
                     }
-                    Some(SidebarContextMenu::File { path, x, y }) => {
-                        let path_for_delete = path.clone();
-                        view! {
-                            <div
-                                style="position: fixed; inset: 0; z-index: 1000;"
-                                on:click=move |_| set_sidebar_context_menu.set(None)
-                            >
-                                <div
-                                    style=format!("position: absolute; left: {}px; top: {}px; background: var(--bg-secondary); border: 1px solid var(--border-color); border-radius: var(--radius-md); padding: 0.25rem 0; box-shadow: 0 4px 12px rgba(0,0,0,0.15); min-width: 8rem;", x, y)
-                                    on:click=move |ev| ev.stop_propagation()
-                                >
-                                    <button
-                                        style="display: block; width: 100%; padding: 0.4rem 0.75rem; text-align: left; font-size: 0.85rem; background: transparent; border: none; cursor: pointer; color: var(--text-primary);"
-                                        on:click=move |_| delete_note(path_for_delete.clone())
-                                    >
-                                        "Delete note"
-                                    </button>
-                                </div>
-                            </div>
-                        }.into_any()
-                    }
-                    None => view! { <></> }.into_any(),
-                }}
-                <section class="editor-pane" style="flex: 1; display: flex; flex-direction: column; background: var(--bg-primary); min-width: 0;">
+                    on_switch_vault=move |value| switch_to_vault(value)
+                    on_select_file=move |filename| select_file(filename)
+                    create_note_in_folder=move |path| create_note_in_folder(path)
+                    create_folder_in_folder=move |path| create_folder_in_folder(path)
+                    delete_folder=move |path| delete_folder(path)
+                    delete_note=move |path| delete_note(path)
+                />
+                <EditorPane>
                     {move || if current_file.get().is_empty() {
-                        let has_vault = !vault_path.get().is_empty();
-                        let message = if has_vault {
-                            "Select a note from the sidebar to start editing."
-                        } else {
-                            "Open a Bedrock vault to begin."
-                        };
                         view! {
-                            <div style="flex: 1; display: flex; align-items: center; justify-content: center; color: var(--text-muted);">
-                                {message}
-                            </div>
-                        }.into_any()
+                            <RecentNotesPane
+                                vault_path=vault_path
+                                recent_notes=recent_notes
+                                files=files
+                                on_select_file=move |filename| select_file(filename)
+                            />
+                        }
+                        .into_any()
                     } else {
                         view! {
-                            <header class="topbar" style="height: var(--topbar-height); border-bottom: 1px solid var(--border-color); display: flex; align-items: center; justify-content: space-between; padding: 0 1.5rem; color: var(--text-muted); font-size: 0.9rem; gap: 1rem;">
-                                <div style="display: flex; align-items: center; gap: 0.75rem; min-width: 0;">
-                                    <div style="display: flex; flex-direction: column; min-width: 0; gap: 0.1rem;">
-                                        <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{move || current_file.get()}</span>
-                                        <span style="font-size: 0.72rem; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title=move || vault_path.get()>{move || format!("Vault: {}", vault_display_name(&vault_path.get()))}</span>
-                                    </div>
-                                    <span style="font-size: 0.8rem; color: var(--text-muted);">{move || save_status.get()}</span>
-                                </div>
-                                <div style="display: flex; gap: 0.5rem;">
-                                    <button style="padding: 0.25rem 0.6rem; font-size: 0.75rem;" on:click=move |_| open_bedrock_vault()>"Open Vault"</button>
-                                    <button style="padding: 0.25rem 0.6rem; font-size: 0.75rem;" on:click=move |_| import_from_obsidian_vault()>"Import Obsidian"</button>
-                                    <button style="padding: 0.25rem 0.6rem; font-size: 0.75rem;" on:click=move |_| rename_current_note()>"Rename"</button>
-                                </div>
-                            </header>
+                            <TopBar
+                                current_file=current_file
+                                vault_path=vault_path
+                                save_status=save_status
+                                on_open_vault=move || open_bedrock_vault()
+                                on_import_obsidian=move || import_from_obsidian_vault()
+                                on_rename=move || rename_current_note()
+                            />
                             <div class="editor-toolbar" style="display: flex; align-items: center; gap: 0.5rem; padding: 0.5rem 1.25rem; border-bottom: 1px solid var(--border-color); background: var(--bg-secondary);">
                                 <button style="padding: 0.2rem 0.5rem; font-size: 0.75rem;" on:click=move |_| run_editor_action("bold")>"Bold"</button>
                                 <button style="padding: 0.2rem 0.5rem; font-size: 0.75rem;" on:click=move |_| run_editor_action("italic")>"Italic"</button>
@@ -3402,7 +2408,7 @@ pub fn App() -> impl IntoView {
                                     node_ref=editor_ref
                                     class="editor-surface"
                                     class:show-syntax=move || show_markdown_syntax.get()
-                                    style="width: 100%; height: 100%; padding: 2rem 3rem; font-family: var(--font-editor); font-size: var(--editor-font-size); line-height: 1.6; color: var(--text-primary); white-space: pre-wrap; word-wrap: break-word; box-sizing: border-box; overflow-y: auto; outline: none; caret-color: var(--text-primary);"
+                                    style="width: 100%; height: 100%; padding: 2rem 3rem; font-family: var(--font-editor); font-size: var(--editor-font-size); line-height: 1.6; color: var(--text-primary); white-space: pre-wrap; word-wrap: break-word; box-sizing: border-box; overflow-x: auto; overflow-y: auto; outline: none; caret-color: var(--text-primary);"
                                     contenteditable="true"
                                     spellcheck="false"
                                     inner_html=move || parsed_html.get()
@@ -3413,7 +2419,8 @@ pub fn App() -> impl IntoView {
                                     on:compositionend=handle_composition_end
                                     on:click=move |_| schedule_selection_sync()
                                     on:keyup=move |e: leptos::ev::KeyboardEvent| {
-                                        if is_selection_navigation_key(&e.key()) {
+                                        let k = e.key();
+                                        if is_selection_navigation_key(&k) {
                                             schedule_selection_sync();
                                         }
                                     }
@@ -3421,156 +2428,15 @@ pub fn App() -> impl IntoView {
                                     on:focus=move |_| schedule_selection_sync()
                                 ></div>
                             </div>
-                        }.into_any()
+                        }
+                        .into_any()
                     }}
-                </section>
-                <aside style="width: 300px; border-left: 1px solid var(--border-color); background: var(--bg-secondary); display: flex; flex-direction: column; min-width: 0;">
-                    <header style="height: var(--topbar-height); display: flex; align-items: center; padding: 0 1rem; border-bottom: 1px solid var(--border-color); color: var(--text-muted); font-size: 0.85rem;">
-                        "Metadata Cache"
-                    </header>
-                    <div style="padding: 1rem; overflow-y: auto; display: flex; flex-direction: column; gap: 1rem;">
-                        <div style="font-size: 0.82rem; color: var(--text-muted);">
-                            {move || {
-                                let note_count = files.get().len();
-                                let tag_count = metadata_cache.get().tags_index.len();
-                                format!("{} indexed notes • {} unique tags", note_count, tag_count)
-                            }}
-                        </div>
-
-                        {move || {
-                            let current = current_file.get();
-                            if current.is_empty() {
-                                return view! { <div style="color: var(--text-muted); font-size: 0.85rem;">"Open a note to inspect headings, links, and backlinks."</div> }.into_any();
-                            }
-
-                            let cache = metadata_cache.get();
-                            let file_cache = cache.file_cache.get(&current).cloned().unwrap_or_default();
-
-                            let backlinks = cache.backlinks.get(&current).cloned().unwrap_or_default();
-
-                            let mut resolved = cache
-                                .resolved_links
-                                .get(&current)
-                                .cloned()
-                                .unwrap_or_default()
-                                .into_iter()
-                                .collect::<Vec<_>>();
-                            resolved.sort_by(|a, b| a.0.cmp(&b.0));
-
-                            let mut unresolved = cache
-                                .unresolved_links
-                                .get(&current)
-                                .cloned()
-                                .unwrap_or_default()
-                                .into_iter()
-                                .collect::<Vec<_>>();
-                            unresolved.sort_by(|a, b| a.0.cmp(&b.0));
-
-                            let mut linked_tags = file_cache.tags.clone();
-                            linked_tags.sort();
-                            linked_tags.dedup();
-
-                            view! {
-                                <>
-                                    <section class="meta-block">
-                                        <h4 style="margin: 0 0 0.45rem 0; font-size: 0.8rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.04em;">"Tags"</h4>
-                                        {if linked_tags.is_empty() {
-                                            view! { <div style="font-size: 0.85rem; color: var(--text-muted);">"No tags"</div> }.into_any()
-                                        } else {
-                                            view! {
-                                                <div style="display: flex; flex-wrap: wrap; gap: 0.4rem;">
-                                                    {linked_tags.into_iter().map(|tag| {
-                                                        view! {
-                                                            <span style="font-size: 0.75rem; padding: 0.2rem 0.4rem; border-radius: 999px; background: color-mix(in srgb, var(--accent-color) 14%, transparent); color: var(--accent-color);">{format!("#{}", tag)}</span>
-                                                        }
-                                                    }).collect::<Vec<_>>()}
-                                                </div>
-                                            }.into_any()
-                                        }}
-                                    </section>
-
-                                    <section class="meta-block">
-                                        <h4 style="margin: 0 0 0.45rem 0; font-size: 0.8rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.04em;">"Headings"</h4>
-                                        {if file_cache.headings.is_empty() {
-                                            view! { <div style="font-size: 0.85rem; color: var(--text-muted);">"No headings"</div> }.into_any()
-                                        } else {
-                                            view! {
-                                                <div style="display: flex; flex-direction: column; gap: 0.35rem;">
-                                                    {file_cache.headings.into_iter().map(|h| {
-                                                        view! {
-                                                            <div style="font-size: 0.82rem; color: var(--text-secondary); display: flex; gap: 0.4rem; align-items: baseline;">
-                                                                <span style="font-family: var(--font-mono); color: var(--text-muted);">{format!("H{}", h.level)}</span>
-                                                                <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{h.text}</span>
-                                                                <span style="margin-left: auto; color: var(--text-muted);">{format!("L{}", h.line)}</span>
-                                                            </div>
-                                                        }
-                                                    }).collect::<Vec<_>>()}
-                                                </div>
-                                            }.into_any()
-                                        }}
-                                    </section>
-
-                                    <section class="meta-block">
-                                        <h4 style="margin: 0 0 0.45rem 0; font-size: 0.8rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.04em;">"Outgoing Links"</h4>
-                                        {if resolved.is_empty() {
-                                            view! { <div style="font-size: 0.85rem; color: var(--text-muted);">"No resolved links"</div> }.into_any()
-                                        } else {
-                                            view! {
-                                                <div style="display: flex; flex-direction: column; gap: 0.3rem;">
-                                                    {resolved.into_iter().map(|(path, count)| {
-                                                        view! {
-                                                            <div style="font-size: 0.82rem; color: var(--text-secondary); display: flex; gap: 0.5rem;">
-                                                                <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{path}</span>
-                                                                <span style="margin-left: auto; color: var(--text-muted);">{count.to_string()}</span>
-                                                            </div>
-                                                        }
-                                                    }).collect::<Vec<_>>()}
-                                                </div>
-                                            }.into_any()
-                                        }}
-                                    </section>
-
-                                    <section class="meta-block">
-                                        <h4 style="margin: 0 0 0.45rem 0; font-size: 0.8rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.04em;">"Backlinks"</h4>
-                                        {if backlinks.is_empty() {
-                                            view! { <div style="font-size: 0.85rem; color: var(--text-muted);">"No backlinks"</div> }.into_any()
-                                        } else {
-                                            view! {
-                                                <div style="display: flex; flex-direction: column; gap: 0.3rem;">
-                                                    {backlinks.into_iter().map(|source| {
-                                                        view! {
-                                                            <div style="font-size: 0.82rem; color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{source}</div>
-                                                        }
-                                                    }).collect::<Vec<_>>()}
-                                                </div>
-                                            }.into_any()
-                                        }}
-                                    </section>
-
-                                    <section class="meta-block">
-                                        <h4 style="margin: 0 0 0.45rem 0; font-size: 0.8rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.04em;">"Unresolved"</h4>
-                                        {if unresolved.is_empty() {
-                                            view! { <div style="font-size: 0.85rem; color: var(--text-muted);">"No unresolved links"</div> }.into_any()
-                                        } else {
-                                            view! {
-                                                <div style="display: flex; flex-direction: column; gap: 0.3rem;">
-                                                    {unresolved.into_iter().map(|(target, count)| {
-                                                        view! {
-                                                            <div style="font-size: 0.82rem; color: #f97316; display: flex; gap: 0.5rem;">
-                                                                <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{target}</span>
-                                                                <span style="margin-left: auto; color: var(--text-muted);">{count.to_string()}</span>
-                                                            </div>
-                                                        }
-                                                    }).collect::<Vec<_>>()}
-                                                </div>
-                                            }.into_any()
-                                        }}
-                                    </section>
-                                </>
-                            }.into_any()
-                        }}
-                    </div>
-                </aside>
+                </EditorPane>
+                <MetadataSidebar
+                    files=files
+                    current_file=current_file
+                    metadata_cache=metadata_cache
+                />
             }
             .into_any()
         }

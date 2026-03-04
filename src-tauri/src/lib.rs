@@ -3,18 +3,22 @@ use regex::{Captures, Regex};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use tauri::{AppHandle, Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
+use std::time::{SystemTime, UNIX_EPOCH};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder};
+
+mod session;
+
+use crate::session::{PendingClose, RecentNotesCache};
+
+pub use crate::session::{
+    cache_recent_notes, close_window_now, load_vault_session, read_recent_notes,
+    save_recent_notes, save_vault_session,
+};
 
 #[derive(serde::Serialize)]
 struct VaultNote {
     path: String,
     content: String,
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
-struct VaultSessionState {
-    open_vaults: Vec<String>,
-    active_vault: Option<String>,
 }
 
 #[derive(serde::Serialize, Clone, Debug)]
@@ -64,106 +68,6 @@ impl VaultImportReport {
             imported_images: 0,
             renamed_notes: 0,
         }
-    }
-}
-
-fn normalize_vault_session_state(state: VaultSessionState) -> VaultSessionState {
-    let normalize_path = |raw: &str| -> Option<String> {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        let candidate = PathBuf::from(trimmed);
-        if candidate.is_dir() {
-            if let Ok(canon) = candidate.canonicalize() {
-                return Some(canon.to_string_lossy().to_string());
-            }
-        }
-        if candidate.is_absolute() {
-            return Some(trimmed.to_string());
-        }
-        None
-    };
-
-    let mut open_vaults = Vec::<String>::new();
-    let mut seen = HashSet::<String>::new();
-    for path in state.open_vaults {
-        let Some(normalized) = normalize_path(&path) else {
-            continue;
-        };
-        if seen.insert(normalized.clone()) {
-            open_vaults.push(normalized);
-        }
-    }
-
-    let mut active_vault = state.active_vault.and_then(|raw| normalize_path(&raw));
-
-    if let Some(active) = active_vault.clone() {
-        if let Some(existing) = open_vaults.iter().find(|p| *p == &active) {
-            active_vault = Some(existing.clone());
-        } else if let Some(first) = open_vaults.first().cloned() {
-            active_vault = Some(first);
-        } else {
-            active_vault = Some(active);
-        }
-    } else if let Some(first) = open_vaults.first().cloned() {
-        active_vault = Some(first);
-    }
-
-    VaultSessionState {
-        open_vaults,
-        active_vault,
-    }
-}
-
-fn vault_session_state_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    Ok(dir.join("vault-session.json"))
-}
-
-fn vault_session_fallback_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let docs = app.path().document_dir().map_err(|e| e.to_string())?;
-    let default_vault = docs.join("BedrockVault");
-    ensure_bedrock_layout(&default_vault)?;
-    Ok(default_vault.join(".bedrock").join("vault-session.json"))
-}
-
-fn write_vault_session_to_path(path: &Path, state: &VaultSessionState) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let json = serde_json::to_string_pretty(state).map_err(|e| e.to_string())?;
-    fs::write(path, json).map_err(|e| e.to_string())
-}
-
-fn read_vault_session_from_path(path: &Path) -> Option<VaultSessionState> {
-    let raw = fs::read_to_string(path).ok()?;
-    serde_json::from_str::<VaultSessionState>(&raw).ok()
-}
-
-fn persist_vault_session_state(app: &AppHandle, state: &VaultSessionState) -> Result<(), String> {
-    let mut wrote = false;
-    let mut last_error = None::<String>;
-
-    if let Ok(path) = vault_session_state_path(app) {
-        match write_vault_session_to_path(&path, state) {
-            Ok(_) => wrote = true,
-            Err(err) => last_error = Some(err),
-        }
-    }
-
-    if let Ok(path) = vault_session_fallback_path(app) {
-        match write_vault_session_to_path(&path, state) {
-            Ok(_) => wrote = true,
-            Err(err) => last_error = Some(err),
-        }
-    }
-
-    if wrote {
-        Ok(())
-    } else {
-        Err(last_error.unwrap_or_else(|| "Unable to persist vault session state.".to_string()))
     }
 }
 
@@ -288,6 +192,13 @@ fn ensure_bedrock_layout(vault_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn current_time_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 fn is_markdown_file(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
@@ -311,6 +222,19 @@ fn is_importable_image_extension(ext: &str) -> bool {
             | "heic"
             | "heif"
     )
+}
+
+fn find_vault_root_for_note(note_path: &Path) -> Option<PathBuf> {
+    let mut current = note_path.parent()?;
+    loop {
+        if current.join(".bedrock").is_dir() || current.join("settings.json").is_file() {
+            return Some(current.to_path_buf());
+        }
+        match current.parent() {
+            Some(parent) => current = parent,
+            None => return None,
+        }
+    }
 }
 
 fn is_importable_asset(path: &Path) -> bool {
@@ -607,8 +531,49 @@ fn read_dir(path: &str) -> Result<ReadDirResult, String> {
 }
 
 #[tauri::command]
-fn read_file(path: &str) -> Result<String, String> {
-    fs::read_to_string(path).map_err(|e| e.to_string())
+fn read_file(path: &str, cache: State<RecentNotesCache>) -> Result<String, String> {
+    let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
+
+    // Backend-side recent-notes tracking: whenever a markdown note is read,
+    // infer its vault root from the filesystem and update the RecentNotesCache
+    // and `.bedrock/recent.json`. This provides a persistence fallback even if
+    // the frontend close flow or cache_recent_notes invocations fail or race.
+    let note_path = PathBuf::from(path);
+    if is_markdown_file(&note_path) {
+        if let Some(vault_root) = find_vault_root_for_note(&note_path) {
+            let canon_root = session::canonicalize_vault_root(
+                &vault_root.to_string_lossy().to_string(),
+            );
+            let vault_key = canon_root.to_string_lossy().to_string();
+            if let Ok(rel) = note_path
+                .strip_prefix(&canon_root)
+                .or_else(|_| note_path.strip_prefix(&vault_root))
+            {
+                let rel_str = rel.to_string_lossy().replace('\\', "/");
+                let title = Path::new(&rel_str)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(&rel_str)
+                    .to_string();
+                    let entry = session::RecentNoteEntry {
+                    path: rel_str.clone(),
+                    title,
+                    last_opened: current_time_millis(),
+                };
+                    if let Ok(mut guard) = cache.0.lock() {
+                    let list = guard.entry(vault_key.clone()).or_insert_with(Vec::new);
+                    list.retain(|e| e.path != entry.path);
+                    list.insert(0, entry);
+                    if list.len() > 50 {
+                    list.truncate(50);
+                    }
+                    let _ = crate::session::write_recent_notes_to_disk(&vault_key, list);
+                }
+            }
+        }
+    }
+
+    Ok(content)
 }
 
 #[tauri::command]
@@ -721,7 +686,10 @@ fn init_vault(app_handle: tauri::AppHandle) -> Result<String, String> {
         fs::write(&welcome_path, "# Welcome to Bedrock\n\nBedrock is a fast, premium markdown note-taking tool.\n\n- Powered by **Rust** and **Tauri**\n- Extensible via CSS variables and plugins.\n").map_err(|e| e.to_string())?;
     }
 
-    Ok(vault_path.to_string_lossy().into_owned())
+    let canon = vault_path
+        .canonicalize()
+        .unwrap_or(vault_path);
+    Ok(canon.to_string_lossy().into_owned())
 }
 
 #[tauri::command]
@@ -772,35 +740,6 @@ fn open_settings_window(app: AppHandle) -> Result<(), String> {
 fn load_settings(vault_path: &str) -> Result<String, String> {
     let settings_path = format!("{}/settings.json", vault_path);
     fs::read_to_string(settings_path).or_else(|_| Ok("{}".to_string()))
-}
-
-fn recent_notes_path(vault_path: &str) -> PathBuf {
-    Path::new(vault_path).join(".bedrock").join("recent.json")
-}
-
-#[derive(serde::Deserialize)]
-struct SaveRecentNotesPayload {
-    vault_path: String,
-    paths: Vec<String>,
-}
-
-#[tauri::command]
-fn read_recent_notes(vault_path: &str) -> Vec<String> {
-    let path = recent_notes_path(vault_path);
-    let raw = match fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-    serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default()
-}
-
-#[tauri::command]
-fn save_recent_notes(payload: SaveRecentNotesPayload) -> Result<(), String> {
-    let dir = Path::new(&payload.vault_path).join(".bedrock");
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let path = dir.join("recent.json");
-    let json = serde_json::to_string(&payload.paths).map_err(|e| e.to_string())?;
-    fs::write(path, json).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -861,43 +800,6 @@ fn pick_bedrock_vault() -> Result<Option<String>, String> {
         let canon = path.canonicalize().map_err(|e| e.to_string())?;
         Ok(Some(canon.to_string_lossy().to_string()))
     }
-}
-
-#[tauri::command]
-fn load_vault_session(app: AppHandle) -> Result<VaultSessionState, String> {
-    let mut parsed = None::<VaultSessionState>;
-
-    if let Ok(path) = vault_session_state_path(&app) {
-        if path.exists() {
-            parsed = read_vault_session_from_path(&path);
-        }
-    }
-    if parsed.is_none() {
-        if let Ok(path) = vault_session_fallback_path(&app) {
-            if path.exists() {
-                parsed = read_vault_session_from_path(&path);
-            }
-        }
-    }
-
-    let parsed = parsed.unwrap_or_default();
-    let normalized = normalize_vault_session_state(parsed);
-    persist_vault_session_state(&app, &normalized)?;
-    Ok(normalized)
-}
-
-#[tauri::command]
-fn save_vault_session(
-    app: AppHandle,
-    open_vaults: Vec<String>,
-    active_vault: Option<String>,
-) -> Result<VaultSessionState, String> {
-    let normalized = normalize_vault_session_state(VaultSessionState {
-        open_vaults,
-        active_vault,
-    });
-    persist_vault_session_state(&app, &normalized)?;
-    Ok(normalized)
 }
 
 #[cfg(test)]
@@ -993,6 +895,8 @@ mod import_tests {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .manage(RecentNotesCache::default())
+        .manage(PendingClose::default())
         .setup(|_| Ok(()))
         .invoke_handler(tauri::generate_handler![
             read_dir,
@@ -1015,18 +919,59 @@ pub fn run() {
             save_vault_session,
             read_recent_notes,
             save_recent_notes,
+            cache_recent_notes,
+            close_window_now,
         ])
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::Destroyed = event {
+                if window.label() == "main" {
+                    // Flush in-memory recent notes to disk so persistence survives even if
+                    // the frontend close flow didn't run or had empty state (e.g. timeout).
+                    if let Some(cache) = window.app_handle().try_state::<RecentNotesCache>() {
+                        crate::session::flush_recent_notes_cache(&cache);
+                    }
+                    window.app_handle().exit(0);
+                }
+                return;
+            }
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let allow = window
+                    .app_handle()
+                    .try_state::<PendingClose>()
+                    .map(|p| crate::session::is_close_allowed(&p))
+                    .unwrap_or(false);
+                if allow {
+                    return;
+                }
+                // Persist recent notes from backend cache before the frontend close flow,
+                // so persistence survives even when the webview never runs the close handler
+                // (e.g. release build) or sends empty state. Delay briefly so any in-flight
+                // cache_recent_notes from the frontend (debounced persist, push_to_recent_notes)
+                // can complete and update the cache first.
+                api.prevent_close();
+                let app = window.app_handle().clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    if let Some(cache) = app.try_state::<RecentNotesCache>() {
+                        crate::session::flush_recent_notes_cache(&cache);
+                    }
+                    if let Some(win) = app.get_webview_window("main") {
+                        let _ = win.emit("save-state-and-close", ());
+                    }
+                });
+            }
+        })
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
         .run(|app, e| {
             #[cfg(target_os = "linux")]
             if let RunEvent::Ready = e {
                 let icon_bytes = include_bytes!("../icons/32x32.png");
-                if let (Some(w), Ok(icon)) = (
+                if let (Some(window), Ok(icon)) = (
                     app.get_webview_window("main"),
                     tauri::image::Image::from_bytes(icon_bytes),
                 ) {
-                    let _ = w.set_icon(icon);
+                    let _ = window.set_icon(icon);
                 }
             }
         });

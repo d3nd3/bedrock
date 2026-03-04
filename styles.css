@@ -35,6 +35,10 @@
   --radius-md: 0.375rem;
   --radius-lg: 0.5rem;
 
+  /* Markdown code colors (light theme) */
+  --md-code-bg: #f3f4f6;
+  --md-code-text: #111827;
+
   /* Reset Base */
   font-family: var(--font-ui);
   font-size: 16px;
@@ -68,6 +72,10 @@
 
     --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.3);
     --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.4), 0 2px 4px -1px rgba(0, 0, 0, 0.2);
+
+    /* Markdown code colors (dark theme) */
+    --md-code-bg: #111827;
+    --md-code-text: #e5e7eb;
   }
 }
 
@@ -162,7 +170,10 @@ a:hover {
   color: var(--accent-hover);
 }
 
-.md-token { font: inherit; }
+.md-token {
+  font: inherit;
+}
+
 /* Default live-edit mode: hide markdown markers unless caret is inside the token span. */
 .md-token-hidden {
   font-size: 0;
@@ -170,6 +181,7 @@ a:hover {
   user-select: none;
   pointer-events: none;
 }
+
 .md-token-visible {
   color: var(--text-secondary);
   opacity: 0.9;
@@ -187,26 +199,78 @@ a:hover {
 }
 
 .md-inline-image-wrap {
-  display: inline-flex;
-  vertical-align: middle;
-  margin-left: 0.35em;
+  display: block;
+  margin-top: 0.5rem;
+  margin-bottom: 0.5rem;
   max-width: min(100%, 36rem);
-  user-select: none;
   pointer-events: none;
+  caret-color: transparent;
+  outline: none;
 }
 
 .md-inline-image {
-  display: block;
-  max-width: min(100%, 32rem);
+  display: inline-block;
+  vertical-align: top;
+  box-sizing: border-box;
+  max-width: min(100%, 36rem);
   max-height: 20rem;
   border-radius: var(--radius-sm);
   border: 1px solid color-mix(in srgb, var(--border-color) 85%, transparent);
   background: color-mix(in srgb, var(--bg-secondary) 65%, transparent);
   box-shadow: var(--shadow-sm);
+  user-select: none;
+  pointer-events: none;
 }
 
 .editor-surface.show-syntax .md-inline-image-wrap {
-  display: none;
+  display: none !important;
+}
+
+.md-embed-source {
+  font-size: 0;
+  line-height: 0;
+  color: transparent;
+}
+
+.md-embed {
+  display: inline;
+  max-width: 100%;
+}
+
+.md-embed.md-embed-caret-on-line {
+  display: block;
+  line-height: 1.6;
+}
+
+.md-embed.md-embed-caret-on-line .md-embed-source {
+  font-size: 0.9em;
+  /* Match editor line height (1.6) so the pushed line aligns: 0.9em * line-height = 1.6em */
+  line-height: 1.778;
+  color: var(--text-secondary);
+  overflow: visible;
+}
+
+/* End the source line so the caret doesn't stretch to the block image (giant caret bug). */
+.md-embed.md-embed-caret-on-line .md-embed-line-end {
+  display: block;
+  height: 0;
+  line-height: 0;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  caret-color: transparent;
+  pointer-events: none;
+  user-select: none;
+}
+
+/* Applied only in the off-line case: the image replaces the line visually,
+   sitting inline-block next to the hidden zero-height markdown text so the
+   line height equals the image height and the caret navigates normally. */
+.md-inline-image-inline {
+  display: inline-block !important;
+  vertical-align: top;
+  margin-top: 0 !important;
+  margin-bottom: 0 !important;
 }
 
 /* Markdown Highlight Styles for In-Place Editor */
@@ -293,6 +357,60 @@ a:hover {
   font-family: var(--font-mono);
   color: var(--md-code-text, var(--text-primary));
   background: color-mix(in srgb, var(--md-code-bg, var(--bg-tertiary)) 75%, transparent);
+}
+
+/* Token-level styling inside fenced code blocks. */
+.hl-code-token-keyword {
+  font-weight: 600;
+  color: color-mix(in srgb, var(--accent-color) 80%, var(--md-code-text, var(--text-primary)));
+}
+
+.hl-code-token-string {
+  color: color-mix(in srgb, #f97316 82%, var(--md-code-text, var(--text-primary)));
+}
+
+.hl-code-token-comment {
+  color: color-mix(in srgb, var(--text-muted) 92%, #6b7280);
+  font-style: italic;
+}
+
+/* Language-aware code fences. These are applied when a ```lang fence
+   is used so different languages can have slightly different accents
+   while still fitting the overall theme. */
+.hl-codeblock[class*="hl-code-lang-"] {
+  background: color-mix(in srgb, var(--md-code-bg, var(--bg-tertiary)) 90%, transparent);
+}
+
+.hl-codeblock.hl-code-lang-bash {
+  color: color-mix(in srgb, #22c55e 80%, var(--md-code-text, var(--text-primary)));
+}
+
+.hl-codeblock.hl-code-lang-rust {
+  color: color-mix(in srgb, #f97316 80%, var(--md-code-text, var(--text-primary)));
+}
+
+.hl-codeblock.hl-code-lang-javascript,
+.hl-codeblock.hl-code-lang-typescript {
+  color: color-mix(in srgb, #eab308 80%, var(--md-code-text, var(--text-primary)));
+}
+
+.hl-codeblock.hl-code-lang-python {
+  color: color-mix(in srgb, #38bdf8 80%, var(--md-code-text, var(--text-primary)));
+}
+
+.hl-codeblock.hl-code-lang-c,
+.hl-codeblock.hl-code-lang-cpp {
+  color: color-mix(in srgb, #60a5fa 80%, var(--md-code-text, var(--text-primary)));
+}
+
+.hl-codeblock.hl-code-lang-csharp {
+  color: color-mix(in srgb, #22c55e 80%, var(--md-code-text, var(--text-primary)));
+}
+
+.hl-codeblock.hl-code-lang-json,
+.hl-codeblock.hl-code-lang-yaml,
+.hl-codeblock.hl-code-lang-toml {
+  color: color-mix(in srgb, #a855f7 80%, var(--md-code-text, var(--text-primary)));
 }
 
 .hl-code-fence {
@@ -402,3 +520,4 @@ a:hover {
   background: color-mix(in srgb, var(--bg-primary) 75%, transparent);
   padding: 0.65rem 0.75rem;
 }
+
