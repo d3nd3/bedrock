@@ -1,9 +1,10 @@
 /dist/
 /target/
+_camera_target/
 /Cargo.lock
 
-# Cursor IDE skills (local agent state)
-.cursor/skills/
+# Cursor IDE (local state, skills, logs, config)
+.cursor/
 
 # Bedrock vault persistence (if a vault lives inside the repo)
 .bedrock/
