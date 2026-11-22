@@ -57,6 +57,7 @@ Bedrock's metadata cache currently indexes:
 - Wiki links (`[[...]]`)
 - Markdown links/images (`[...](...)`, `![...](...)`) for local targets
 - Resolved links, unresolved links, and backlinks
+- Unlinked mentions (notes that mention a note's title in plain text without yet linking to it)
 
 External URL markdown links (for example `https://...` and `mailto:...`) are ignored by local note resolution.
 

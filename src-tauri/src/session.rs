@@ -28,14 +28,15 @@ fn normalize_vault_session_state(state: VaultSessionState) -> VaultSessionState 
         if trimmed.is_empty() {
             return None;
         }
-        let candidate = PathBuf::from(trimmed);
+        let expanded = expand_tilde(trimmed);
+        let candidate = PathBuf::from(&expanded);
         if candidate.is_dir() {
             if let Ok(canon) = candidate.canonicalize() {
                 return Some(canon.to_string_lossy().to_string());
             }
         }
         if candidate.is_absolute() {
-            return Some(trimmed.to_string());
+            return Some(expanded);
         }
         None
     };
@@ -183,9 +184,28 @@ fn recent_notes_path(vault_path: &str) -> PathBuf {
 }
 
 pub(crate) fn canonicalize_vault_root(vault_path: &str) -> PathBuf {
-    Path::new(vault_path)
+    let expanded = expand_tilde(vault_path);
+    Path::new(&expanded)
         .canonicalize()
-        .unwrap_or_else(|_| PathBuf::from(vault_path))
+        .unwrap_or_else(|_| PathBuf::from(expanded))
+}
+
+/// Expands leading ~ to the current user's home directory so paths like
+/// ~/Desktop/TestBedrockVault resolve and load_note_colors can find .bedrock/obsidian-file-color/data.json.
+fn expand_tilde(path: &str) -> String {
+    let path = path.trim();
+    if path.is_empty() {
+        return path.to_string();
+    }
+    if path == "~" {
+        return std::env::var("HOME").unwrap_or_else(|_| path.to_string());
+    }
+    if path.starts_with("~/") || path.starts_with("~\\") {
+        if let Ok(home) = std::env::var("HOME") {
+            return format!("{}{}", home, path.get(1..).unwrap_or(""));
+        }
+    }
+    path.to_string()
 }
 
 pub struct RecentNotesCache(pub(crate) Mutex<HashMap<String, Vec<RecentNoteEntry>>>);
@@ -425,7 +445,7 @@ pub fn is_close_allowed(pending: &PendingClose) -> bool {
 mod tests {
     use super::*;
     use std::fs;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {

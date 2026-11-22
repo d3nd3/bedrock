@@ -33,24 +33,28 @@ where
                     {move || save_status.get()}
                 </span>
             </div>
-            <div style="display: flex; gap: 0.5rem;">
+            <div style="display: flex; gap: 0.5rem; flex-shrink: 0; align-items: center;">
                 <button
-                    style="padding: 0.25rem 0.6rem; font-size: 0.75rem;"
+                    style="padding: 0.25rem 0.5rem; font-size: 1rem; background: transparent; border: none; cursor: pointer; color: var(--text-muted);"
+                    title="Open Vault"
                     on:click=move |_| on_open_vault()
                 >
-                    "Open Vault"
+                    "🗂"
                 </button>
                 <button
-                    style="padding: 0.25rem 0.6rem; font-size: 0.75rem;"
+                    data-import-obsidian="true"
+                    style="padding: 0.25rem 0.5rem; font-size: 1rem; background: transparent; border: none; cursor: pointer; color: var(--text-muted);"
+                    title="Import from Obsidian vault"
                     on:click=move |_| on_import_obsidian()
                 >
-                    "Import Obsidian"
+                    "⇪"
                 </button>
                 <button
-                    style="padding: 0.25rem 0.6rem; font-size: 0.75rem;"
+                    style="padding: 0.25rem 0.5rem; font-size: 1rem; background: transparent; border: none; cursor: pointer; color: var(--text-muted);"
+                    title="Rename"
                     on:click=move |_| on_rename()
                 >
-                    "Rename"
+                    "✎"
                 </button>
             </div>
         </header>

@@ -25,6 +25,9 @@ pub struct MetadataCacheState {
     pub unresolved_links: HashMap<String, HashMap<String, usize>>,
     pub backlinks: HashMap<String, Vec<String>>,
     pub tags_index: HashMap<String, Vec<String>>,
+    /// For each target note, tracks notes that mention its title in plain text
+    /// but do not currently link to it via a resolved or unresolved link.
+    pub unlinked_mentions: HashMap<String, Vec<String>>,
 }
 
 struct InlineMatch {
@@ -41,6 +44,8 @@ struct InlineMatch {
     /// Inline-block preview shown off-line (caret is elsewhere).
     preview_html_inline: Option<String>,
     hide_entire_unless_caret: bool,
+    /// For wiki links: the raw link target (before |) so Ctrl+click can open the note.
+    data_note_link: Option<String>,
 }
 
 pub struct ImageRenderContext<'a> {
@@ -115,6 +120,7 @@ fn collect_delimited_matches(
                 preview_html: None,
                 preview_html_inline: None,
                 hide_entire_unless_caret: false,
+                data_note_link: None,
             });
         } else {
             pending_open = Some(token);
@@ -136,6 +142,7 @@ fn collect_delimited_matches(
             preview_html: None,
             preview_html_inline: None,
             hide_entire_unless_caret: false,
+            data_note_link: None,
         });
     }
 
@@ -759,6 +766,7 @@ pub fn highlight_inline(
                 preview_html: None,
                 preview_html_inline: None,
                 hide_entire_unless_caret: false,
+                data_note_link: None,
             },
         );
     }
@@ -788,6 +796,7 @@ pub fn highlight_inline(
                 preview_html,
                 preview_html_inline,
                 hide_entire_unless_caret: true,
+                data_note_link: None,
             },
         );
     }
@@ -795,6 +804,8 @@ pub fn highlight_inline(
     for cap in re_wiki.captures_iter(text) {
         let m = cap.get(0).unwrap();
         let inner = cap.get(1).unwrap();
+        let raw_inner = inner.as_str();
+        let link_target = raw_inner.split('|').next().unwrap_or("").trim();
         push_non_overlapping(
             &mut matches,
             InlineMatch {
@@ -809,6 +820,11 @@ pub fn highlight_inline(
                 preview_html: None,
                 preview_html_inline: None,
                 hide_entire_unless_caret: false,
+                data_note_link: if link_target.is_empty() {
+                    None
+                } else {
+                    Some(link_target.to_string())
+                },
             },
         );
     }
@@ -834,6 +850,7 @@ pub fn highlight_inline(
                 preview_html,
                 preview_html_inline,
                 hide_entire_unless_caret: true,
+                data_note_link: None,
             },
         );
     }
@@ -854,6 +871,7 @@ pub fn highlight_inline(
                 preview_html: None,
                 preview_html_inline: None,
                 hide_entire_unless_caret: false,
+                data_note_link: None,
             },
         );
     }
@@ -900,6 +918,7 @@ pub fn highlight_inline(
                 preview_html: None,
                 preview_html_inline: None,
                 hide_entire_unless_caret: false,
+                data_note_link: None,
             },
         );
     }
@@ -919,6 +938,7 @@ pub fn highlight_inline(
                 preview_html: None,
                 preview_html_inline: None,
                 hide_entire_unless_caret: false,
+                data_note_link: None,
             },
         );
     }
@@ -938,6 +958,7 @@ pub fn highlight_inline(
                 preview_html: None,
                 preview_html_inline: None,
                 hide_entire_unless_caret: false,
+                data_note_link: None,
             },
         );
     }
@@ -957,6 +978,7 @@ pub fn highlight_inline(
                 preview_html: None,
                 preview_html_inline: None,
                 hide_entire_unless_caret: false,
+                data_note_link: None,
             },
         );
     }
@@ -976,6 +998,7 @@ pub fn highlight_inline(
                 preview_html: None,
                 preview_html_inline: None,
                 hide_entire_unless_caret: false,
+                data_note_link: None,
             },
         );
     }
@@ -1027,6 +1050,10 @@ pub fn highlight_inline(
             out.push_str(&escape_html(&text[m.start..m.start + m.open_len]));
             out.push_str("</span><span class=\"");
             out.push_str(m.class);
+            if let Some(ref link) = m.data_note_link {
+                out.push_str("\" data-note-link=\"");
+                out.push_str(&escape_html_attr(link));
+            }
             out.push_str("\">");
             out.push_str(&escape_html(&text[m.inner_start..m.inner_end]));
             out.push_str("</span><span class=\"md-token md-token-visible\">");
@@ -1039,6 +1066,10 @@ pub fn highlight_inline(
             out.push_str(&escape_html(&text[m.start..m.start + m.open_len]));
             out.push_str("</span><span class=\"");
             out.push_str(m.class);
+            if let Some(ref link) = m.data_note_link {
+                out.push_str("\" data-note-link=\"");
+                out.push_str(&escape_html_attr(link));
+            }
             out.push_str("\">");
             out.push_str(&escape_html(&text[m.inner_start..m.inner_end]));
             out.push_str("</span><span class=\"md-token md-token-hidden\">");
@@ -1047,6 +1078,10 @@ pub fn highlight_inline(
         } else {
             out.push_str("<span class=\"");
             out.push_str(m.class);
+            if let Some(ref link) = m.data_note_link {
+                out.push_str("\" data-note-link=\"");
+                out.push_str(&escape_html_attr(link));
+            }
             out.push_str("\">");
             out.push_str(&escape_html(&text[m.start..m.end]));
             out.push_str("</span>");
@@ -1259,11 +1294,15 @@ pub fn highlight_markdown_for_editor(
 
 pub fn extract_file_cache(text: &str) -> FileCache {
     static RE_HEADING: OnceLock<Regex> = OnceLock::new();
+    static RE_SETEXT_H1: OnceLock<Regex> = OnceLock::new();
+    static RE_SETEXT_H2: OnceLock<Regex> = OnceLock::new();
     static RE_WIKI: OnceLock<Regex> = OnceLock::new();
     static RE_MD_LINK: OnceLock<Regex> = OnceLock::new();
     static RE_TAG: OnceLock<Regex> = OnceLock::new();
 
-    let re_heading = RE_HEADING.get_or_init(|| Regex::new(r"^(#{1,6})[ \t]+(.+?)\s*$").unwrap());
+    let re_heading = RE_HEADING.get_or_init(|| Regex::new(r"^(#{1,6})[ \t]*(.+?)\s*$").unwrap());
+    let re_setext_h1 = RE_SETEXT_H1.get_or_init(|| Regex::new(r"^=+\s*$").unwrap());
+    let re_setext_h2 = RE_SETEXT_H2.get_or_init(|| Regex::new(r"^-+\s*$").unwrap());
     let re_wiki = RE_WIKI.get_or_init(|| Regex::new(r"\[\[([^\]]+)\]\]").unwrap());
     let re_md_link = RE_MD_LINK.get_or_init(|| Regex::new(r"!?\[[^\]\n]*\]\(([^)\n]+)\)").unwrap());
     let re_tag = RE_TAG.get_or_init(|| Regex::new(r"#[A-Za-z][A-Za-z0-9_/-]*").unwrap());
@@ -1272,23 +1311,105 @@ pub fn extract_file_cache(text: &str) -> FileCache {
     let mut tags = Vec::new();
     let mut links = Vec::new();
 
-    for (idx, line) in text.lines().enumerate() {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut atx_line_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+    for (idx, line) in lines.iter().enumerate() {
         if let Some(cap) = re_heading.captures(line) {
             let level = cap.get(1).map(|m| m.as_str().len()).unwrap_or(1) as u8;
             let text = cap
                 .get(2)
                 .map(|m| m.as_str().trim().to_string())
                 .unwrap_or_default();
-            headings.push(HeadingCache {
-                level,
-                text,
-                line: idx + 1,
-            });
+            if !text.is_empty() {
+                atx_line_indices.insert(idx);
+                headings.push(HeadingCache {
+                    level,
+                    text,
+                    line: idx + 1,
+                });
+            }
         }
         for tag in re_tag.find_iter(line) {
             tags.push(tag.as_str().trim_start_matches('#').to_ascii_lowercase());
         }
     }
+
+    // Setext-style headings: line of text followed by === (H1) or --- (H2). CommonMark allows 2+ chars.
+    let mut setext_title_line_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for (idx, line) in lines.iter().enumerate() {
+        if atx_line_indices.contains(&idx) {
+            continue;
+        }
+        let next_idx = idx + 1;
+        let next_line = match lines.get(next_idx) {
+            Some(l) => l.trim(),
+            None => continue,
+        };
+        let title = line.trim();
+        if title.is_empty() {
+            continue;
+        }
+        if re_setext_h1.is_match(next_line) {
+            setext_title_line_indices.insert(idx);
+            let text = if title.len() > 4 && title.starts_with("**") && title.ends_with("**") {
+                title[2..title.len() - 2].trim().to_string()
+            } else if title.len() > 4 && title.starts_with("__") && title.ends_with("__") {
+                title[2..title.len() - 2].trim().to_string()
+            } else {
+                title.to_string()
+            };
+            if !text.is_empty() {
+                headings.push(HeadingCache {
+                    level: 1,
+                    text,
+                    line: idx + 1,
+                });
+            }
+        } else if re_setext_h2.is_match(next_line) {
+            setext_title_line_indices.insert(idx);
+            let text = if title.len() > 4 && title.starts_with("**") && title.ends_with("**") {
+                title[2..title.len() - 2].trim().to_string()
+            } else if title.len() > 4 && title.starts_with("__") && title.ends_with("__") {
+                title[2..title.len() - 2].trim().to_string()
+            } else {
+                title.to_string()
+            };
+            if !text.is_empty() {
+                headings.push(HeadingCache {
+                    level: 2,
+                    text,
+                    line: idx + 1,
+                });
+            }
+        }
+    }
+
+    // Bold-only lines (e.g. **Tier1** or __Tier2__) as structural section headers (Goals 3 & 7).
+    // Skip lines already captured as ATX or setext title to avoid duplicates.
+    for (idx, line) in lines.iter().enumerate() {
+        if atx_line_indices.contains(&idx) || setext_title_line_indices.contains(&idx) {
+            continue;
+        }
+        let trimmed = line.trim();
+        let inner = if trimmed.len() > 4 && trimmed.starts_with("**") && trimmed.ends_with("**") {
+            trimmed[2..trimmed.len() - 2].trim()
+        } else if trimmed.len() > 4 && trimmed.starts_with("__") && trimmed.ends_with("__") {
+            trimmed[2..trimmed.len() - 2].trim()
+        } else {
+            continue;
+        };
+        if inner.is_empty() {
+            continue;
+        }
+        headings.push(HeadingCache {
+            level: 2,
+            text: inner.to_string(),
+            line: idx + 1,
+        });
+    }
+
+    headings.sort_by_key(|h| h.line);
 
     for cap in re_wiki.captures_iter(text) {
         let raw_inner = cap.get(1).map(|m| m.as_str()).unwrap_or_default();
@@ -1433,6 +1554,82 @@ pub fn build_metadata_cache(
             } else {
                 let by_source = state.unresolved_links.entry(path.clone()).or_default();
                 *by_source.entry(link).or_insert(0) += 1;
+            }
+        }
+    }
+
+    // Compute "unlinked mentions": for each target note, find other notes that
+    // mention its title in plain text but do not currently link to it. This is
+    // a best-effort, heuristic index intended for "unlinked mentions" UI and
+    // vault-wide discovery features rather than exact reference tracking.
+    //
+    // For very large vaults, this O(N²) pass can be expensive and can make
+    // editing or switching notes feel sluggish. To keep the UI responsive on
+    // big vaults, we skip unlinked-mentions when the note count exceeds a
+    // conservative threshold.
+    const UNLINKED_MENTIONS_MAX_FILES: usize = 400;
+    if files.len() <= UNLINKED_MENTIONS_MAX_FILES {
+        // Precompute lowercase text for all notes once so we don't repeatedly
+        // allocate and lowercase inside the nested loops.
+        let mut notes_lower: HashMap<String, String> = HashMap::new();
+        for (path, text) in notes.iter() {
+            if !text.is_empty() {
+                notes_lower.insert(path.clone(), text.to_ascii_lowercase());
+            }
+        }
+
+        for target in files {
+            let stem = Path::new(target)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .trim();
+            if stem.is_empty() {
+                continue;
+            }
+            let stem_lower = stem.to_ascii_lowercase();
+            let mut sources: Vec<String> = Vec::new();
+
+            for source in files {
+                if collapse_path(source) == collapse_path(target) {
+                    continue;
+                }
+
+                // Skip if there is already a resolved link/backlink relationship.
+                let already_linked = state
+                    .resolved_links
+                    .get(source)
+                    .map(|by_target| {
+                        by_target
+                            .keys()
+                            .any(|t| collapse_path(t) == collapse_path(target))
+                    })
+                    .unwrap_or(false)
+                    || state
+                        .backlinks
+                        .get(target)
+                        .map(|v| {
+                            v.iter()
+                                .any(|p| collapse_path(p) == collapse_path(source))
+                        })
+                        .unwrap_or(false);
+                if already_linked {
+                    continue;
+                }
+
+                let text_lower = match notes_lower.get(source) {
+                    Some(t) if !t.is_empty() => t,
+                    _ => continue,
+                };
+                if text_lower.contains(&stem_lower) {
+                    sources.push(source.clone());
+                }
+            }
+
+            if !sources.is_empty() {
+                sources.sort();
+                sources.dedup();
+                state.unlinked_mentions.insert(target.clone(), sources);
             }
         }
     }
@@ -1582,6 +1779,32 @@ mod tests {
         assert!(cache.links.iter().any(|link| link == "Folder/Note.md"));
         assert!(cache.links.iter().any(|link| link == "Image.png"));
         assert!(!cache.links.iter().any(|link| link.contains("https://")));
+    }
+
+    #[test]
+    fn metadata_extracts_atx_and_setext_headings() {
+        let cache = extract_file_cache(
+            "# ATX H1\n\nCORE ITEM BUILD\n===============\n\nTier1\n-----\n\n## ATX H2\n",
+        );
+        assert_eq!(cache.headings.len(), 4);
+        assert!(cache.headings.iter().any(|h| h.level == 1 && h.text == "ATX H1"));
+        assert!(cache.headings.iter().any(|h| h.level == 1 && h.text == "CORE ITEM BUILD"));
+        assert!(cache.headings.iter().any(|h| h.level == 2 && h.text == "Tier1"));
+        assert!(cache.headings.iter().any(|h| h.level == 2 && h.text == "ATX H2"));
+        let lines: Vec<usize> = cache.headings.iter().map(|h| h.line).collect();
+        assert_eq!(lines, vec![1, 3, 6, 9], "headings should be sorted by line");
+    }
+
+    #[test]
+    fn metadata_extracts_bold_only_lines_as_headings() {
+        let cache = extract_file_cache(
+            "**Tier1**\nDorio, Dice, Circlet\n\n**Tier2**\nMystical, Alert, Tough\n\n**Tier3**\n\n__Tier4__\n",
+        );
+        assert!(cache.headings.len() >= 4, "expected Tier1–Tier4 as structural headings");
+        assert!(cache.headings.iter().any(|h| h.text == "Tier1"));
+        assert!(cache.headings.iter().any(|h| h.text == "Tier2"));
+        assert!(cache.headings.iter().any(|h| h.text == "Tier3"));
+        assert!(cache.headings.iter().any(|h| h.text == "Tier4"));
     }
 
     #[test]

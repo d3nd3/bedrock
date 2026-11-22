@@ -59,17 +59,17 @@ where
                                         let on_click = handler.clone();
                                         view! {
                                             <div
-                                                style="padding: 0.4rem 0.55rem; border-radius: var(--radius-md); cursor: pointer; font-size: 0.85rem; display: flex; flex-direction: column; gap: 0.05rem; transition: background 0.15s ease;"
+                                                style="padding: 0.4rem 0.55rem; border-radius: var(--radius-md); cursor: pointer; font-size: 0.85rem; display: flex; flex-direction: column; gap: 0.05rem; transition: background 0.15s ease; min-width: 0;"
                                                 on:click=move |_| on_click(filename.clone())
                                                 title=entry.path.clone()
                                             >
-                                                <div style="display: flex; align-items: baseline; gap: 0.35rem;">
-                                                    <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+                                                <div style="display: flex; align-items: baseline; gap: 0.35rem; min-width: 0;">
+                                                    <span style="flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
                                                         {name}
                                                     </span>
                                                     {move || if !last_opened.is_empty() {
                                                         view! {
-                                                            <span style="margin-left: auto; font-size: 0.72rem; color: var(--text-muted);">
+                                                            <span style="margin-left: auto; flex-shrink: 0; font-size: 0.72rem; color: var(--text-muted);">
                                                                 {format!("Last opened {}", last_opened)}
                                                             </span>
                                                         }
@@ -78,7 +78,7 @@ where
                                                         view! { <></> }.into_any()
                                                     }}
                                                 </div>
-                                                <span style="font-size: 0.74rem; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+                                                <span style="font-size: 0.74rem; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;">
                                                     {entry.path.clone()}
                                                 </span>
                                             </div>

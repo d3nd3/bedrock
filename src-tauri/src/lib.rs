@@ -1,7 +1,8 @@
 use base64::Engine;
 use regex::{Captures, Regex};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder};
@@ -33,6 +34,13 @@ struct VaultImportReport {
     scanned_images: usize,
     imported_images: usize,
     renamed_notes: usize,
+    imported_note_colors: usize,
+    /// When note colors were imported, the full path→hex map so the frontend can show colors on first paint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    imported_note_colors_map: Option<HashMap<String, String>>,
+    /// When data.json was copied, the parsed palette (id, name, value) for the "Label color" menu.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    imported_note_color_palette: Option<Vec<NoteColorPaletteEntry>>,
 }
 
 impl VaultImportReport {
@@ -48,6 +56,9 @@ impl VaultImportReport {
             scanned_images: 0,
             imported_images: 0,
             renamed_notes: 0,
+            imported_note_colors: 0,
+            imported_note_colors_map: None,
+            imported_note_color_palette: None,
         }
     }
 
@@ -67,12 +78,279 @@ impl VaultImportReport {
             scanned_images: 0,
             imported_images: 0,
             renamed_notes: 0,
+            imported_note_colors: 0,
+            imported_note_colors_map: None,
+            imported_note_color_palette: None,
         }
     }
 }
 
+#[derive(serde::Deserialize, serde::Serialize, Clone)]
+struct ObsidianFileColorPaletteEntry {
+    id: String,
+    #[allow(dead_code)]
+    name: String,
+    /// Hex color; plugin may store as "color" or "value" in data.json. We serialize as "value" for Obsidian.
+    #[serde(rename = "value", alias = "color")]
+    color: String,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Clone)]
+struct ObsidianFileColorFileEntry {
+    path: String,
+    color: String,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Clone)]
+struct ObsidianFileColorData {
+    #[serde(default, rename = "cascadeColors")]
+    cascade_colors: bool,
+    #[serde(default, rename = "colorBackground", alias = "backgroundColors")]
+    color_background: bool,
+    #[serde(default)]
+    palette: Vec<ObsidianFileColorPaletteEntry>,
+    #[serde(default, rename = "fileColors")]
+    file_colors: Vec<ObsidianFileColorFileEntry>,
+}
+
+/// Palette entry exposed to the frontend for "Label color" menu (id, name, hex value).
+#[derive(serde::Serialize, Clone, Debug)]
+struct NoteColorPaletteEntry {
+    id: String,
+    name: String,
+    value: String,
+}
+
+/// Return type of load_note_colors so the frontend can compare canonical paths before applying.
+#[derive(serde::Serialize, Clone, Debug)]
+struct LoadNoteColorsResult {
+    canonical_vault_path: String,
+    colors: HashMap<String, String>,
+}
+
 fn normalize_rel_path(path: &str) -> String {
     path.trim().replace('\\', "/").trim_matches('/').to_string()
+}
+
+/// Canonical key for note-colors map so that "MentalHealth" (Obsidian) and "Mental-health" (filesystem) match.
+/// Each segment is lowercased and has hyphens/underscores removed.
+fn canonical_note_color_key(path: &str) -> String {
+    let normalized = normalize_rel_path(path);
+    normalized
+        .split('/')
+        .map(|s| {
+            s.to_ascii_lowercase()
+                .replace('-', "")
+                .replace('_', "")
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Build path -> hex map from obsidian-file-color data (palette + fileColors).
+/// Used by import and by load_note_colors fallback when reading .bedrock/obsidian-file-color/data.json.
+/// Keys use canonical_note_color_key so that Obsidian paths (e.g. "MentalHealth") match filesystem paths (e.g. "Mental-health").
+/// If a fileColor entry's color is not in the palette, we treat it as a hex value if it looks like one (#rgb, #rrggbb, etc.).
+fn obsidian_file_color_to_map(data: &ObsidianFileColorData) -> HashMap<String, String> {
+    let mut palette_by_id: HashMap<String, String> = HashMap::new();
+    for entry in &data.palette {
+        if !entry.color.trim().is_empty() {
+            let hex = entry.color.trim().to_ascii_lowercase();
+            palette_by_id.insert(entry.id.clone(), hex);
+        }
+    }
+    let mut out = HashMap::new();
+    for entry in &data.file_colors {
+        let hex = palette_by_id
+            .get(&entry.color)
+            .cloned()
+            .or_else(|| {
+                let s = entry.color.trim();
+                if s.starts_with('#')
+                    && (s.len() == 4 || s.len() == 5 || s.len() == 7 || s.len() == 9)
+                    && s[1..].chars().all(|c| c.is_ascii_hexdigit())
+                {
+                    Some(s.to_ascii_lowercase())
+                } else {
+                    None
+                }
+            });
+        if let Some(hex) = hex {
+            let raw_path = normalize_rel_path(&entry.path);
+            let key = canonical_note_color_key(&raw_path);
+            let is_md = key.ends_with(".md");
+            out.insert(key.clone(), hex.clone());
+            if !is_md {
+                out.insert(format!("{key}.md"), hex);
+            }
+        }
+    }
+    out
+}
+
+/// Returns true if the vault directory contains `.obsidian` (hybrid vault: Obsidian + Bedrock).
+fn is_hybrid_vault(root: &Path) -> bool {
+    root.join(".obsidian").is_dir()
+}
+
+/// Load existing obsidian-file-color data from .bedrock or .obsidian for palette/options.
+/// For hybrid vaults, prefers the source that has non-empty fileColors so we don't show no colours
+/// when Obsidian's data.json exists but is empty and .bedrock has the real data.
+fn load_obsidian_file_color_data(root: &Path) -> Option<ObsidianFileColorData> {
+    // For hybrid vaults (both `.bedrock` and `.obsidian` present), prefer the Obsidian plugin
+    // data as the source of truth so changes made in Obsidian are picked up by Bedrock. For
+    // Bedrock-only vaults that may have a copied data.json under `.bedrock/obsidian-file-color`,
+    // prefer that path.
+    let mut paths = Vec::new();
+    if is_hybrid_vault(root) {
+        paths.push(
+            root.join(".obsidian")
+                .join("plugins")
+                .join("obsidian-file-color")
+                .join("data.json"),
+        );
+        paths.push(
+            root.join(".bedrock")
+                .join("obsidian-file-color")
+                .join("data.json"),
+        );
+    } else {
+        paths.push(
+            root.join(".bedrock")
+                .join("obsidian-file-color")
+                .join("data.json"),
+        );
+        paths.push(
+            root.join(".obsidian")
+                .join("plugins")
+                .join("obsidian-file-color")
+                .join("data.json"),
+        );
+    }
+
+    let mut best: Option<ObsidianFileColorData> = None;
+    for p in paths {
+        let rel_display = p.display().to_string();
+        if p.is_file() {
+            if let Ok(raw) = fs::read_to_string(&p) {
+                if let Ok(data) = serde_json::from_str::<ObsidianFileColorData>(&raw) {
+                    let n = data.file_colors.len();
+                    eprintln!(
+                        "[Bedrock] load_obsidian_file_color_data: {} — {} fileColor(s)",
+                        rel_display,
+                        n
+                    );
+                    let replace = best.as_ref().map(|b| b.file_colors.len() < n).unwrap_or(true);
+                    if replace {
+                        best = Some(data);
+                    }
+                } else {
+                    eprintln!("[Bedrock] load_obsidian_file_color_data: {} — parse failed", rel_display);
+                }
+            } else {
+                eprintln!("[Bedrock] load_obsidian_file_color_data: {} — read failed", rel_display);
+            }
+        } else {
+            eprintln!("[Bedrock] load_obsidian_file_color_data: {} — not a file (missing)", rel_display);
+        }
+    }
+    best
+}
+
+/// Build Obsidian-format data from our path→hex map for syncing to
+/// `.obsidian/plugins/obsidian-file-color/data.json`.
+///
+/// - Uses the existing palette when present and adds new palette entries for unknown hex values.
+/// - Attempts to map our canonical keys back to real filesystem/plugin paths so Obsidian can
+///   match `file.path === settings.fileColors[].path` in its explorer.
+fn build_obsidian_file_color_data(
+    root: &Path,
+    colors: &HashMap<String, String>,
+    existing: Option<&ObsidianFileColorData>,
+) -> ObsidianFileColorData {
+    let (mut palette, cascade_colors, color_background) = if let Some(ex) = existing {
+        (
+            ex.palette.clone(),
+            ex.cascade_colors,
+            ex.color_background,
+        )
+    } else {
+        (Vec::<ObsidianFileColorPaletteEntry>::new(), false, false)
+    };
+    let mut hex_to_id: HashMap<String, String> = palette
+        .iter()
+        .filter(|e| !e.color.trim().is_empty())
+        .map(|e| (e.color.trim().to_ascii_lowercase(), e.id.clone()))
+        .collect();
+    let mut next_id = 0u64;
+
+    // Index of canonical path key -> one or more concrete path strings. We prefer:
+    // 1) Paths from the existing plugin data (so we preserve Obsidian's exact casing),
+    // 2) Paths from the filesystem (dirs + .md files),
+    // 3) Falling back to the raw key from `colors` if nothing else matches.
+    let mut path_index: HashMap<String, Vec<String>> = HashMap::new();
+
+    if let Some(ex) = existing {
+        for entry in &ex.file_colors {
+            let key = canonical_note_color_key(&entry.path);
+            path_index
+                .entry(key)
+                .or_default()
+                .push(entry.path.clone());
+        }
+    }
+
+    // Collect directories relative to the vault root.
+    let mut dirs = Vec::<String>::new();
+    if collect_relative_dirs(root, root, &mut dirs).is_ok() {
+        for rel in dirs {
+            let key = canonical_note_color_key(&rel);
+            path_index.entry(key).or_default().push(rel);
+        }
+    }
+
+    // Collect markdown files relative to the vault root.
+    let mut notes = Vec::<String>::new();
+    if collect_markdown_files(root, root, &mut notes).is_ok() {
+        for rel in notes {
+            let key = canonical_note_color_key(&rel);
+            path_index.entry(key).or_default().push(rel);
+        }
+    }
+
+    let mut file_colors = Vec::new();
+    for (raw_key, hex) in colors {
+        let hex_norm = hex.trim().to_ascii_lowercase();
+        if hex_norm.is_empty() {
+            continue;
+        }
+        let id = hex_to_id.get(&hex_norm).cloned().unwrap_or_else(|| {
+            let id = format!("bedrock_{:x}", next_id);
+            next_id += 1;
+            palette.push(ObsidianFileColorPaletteEntry {
+                id: id.clone(),
+                name: format!("Custom {}", hex),
+                color: hex.clone(),
+            });
+            hex_to_id.insert(hex_norm, id.clone());
+            id
+        });
+        let key = canonical_note_color_key(raw_key);
+        let path = path_index
+            .get(&key)
+            .and_then(|v| v.first().cloned())
+            .unwrap_or_else(|| raw_key.clone());
+        file_colors.push(ObsidianFileColorFileEntry {
+            path,
+            color: id,
+        });
+    }
+    ObsidianFileColorData {
+        cascade_colors,
+        color_background,
+        palette,
+        file_colors,
+    }
 }
 
 fn ensure_markdown_extension(path: &str) -> String {
@@ -347,6 +625,47 @@ fn import_obsidian_vault_notes(
 
     ensure_bedrock_layout(&destination_canon)?;
 
+    // Optional: import note label colors from the Obsidian `obsidian-file-color` plugin.
+    let mut source_note_colors: HashMap<String, String> = HashMap::new();
+    let mut imported_palette: Option<Vec<NoteColorPaletteEntry>> = None;
+    let plugin_data_path = source_canon
+        .join(".obsidian")
+        .join("plugins")
+        .join("obsidian-file-color")
+        .join("data.json");
+    if plugin_data_path.is_file() {
+        if let Ok(raw) = fs::read_to_string(&plugin_data_path) {
+            if let Ok(parsed) = serde_json::from_str::<ObsidianFileColorData>(&raw) {
+                let from_plugin = obsidian_file_color_to_map(&parsed);
+                for (key, hex) in from_plugin {
+                    source_note_colors.insert(key, hex);
+                }
+                // Copy the full data.json (including palette) to destination so the vault has
+                // the same palette for "Label color" and fallback loading.
+                let dest_plugin_dir = destination_canon.join(".bedrock").join("obsidian-file-color");
+                if fs::create_dir_all(&dest_plugin_dir).is_ok() {
+                    let dest_plugin_path = dest_plugin_dir.join("data.json");
+                    let _ = fs::write(&dest_plugin_path, &raw);
+                }
+                // Build palette for the report so the frontend can show it on first paint.
+                imported_palette = Some(
+                    parsed
+                        .palette
+                        .into_iter()
+                        .filter(|e| !e.color.trim().is_empty())
+                        .map(|e| NoteColorPaletteEntry {
+                            id: e.id,
+                            name: e.name,
+                            value: e.color,
+                        })
+                        .collect(),
+                );
+            }
+        }
+    }
+
+    let mut destination_note_colors: HashMap<String, String> = HashMap::new();
+
     let mut rel_import_files = Vec::<PathBuf>::new();
     collect_importable_files_for_import(&source_canon, &source_canon, &mut rel_import_files)?;
     rel_import_files.sort_by(|a, b| a.to_string_lossy().cmp(&b.to_string_lossy()));
@@ -372,6 +691,26 @@ fn import_obsidian_vault_notes(
         fs::write(&destination_file, content).map_err(|e| e.to_string())?;
 
         if is_markdown_file(rel) {
+            let rel_str = normalize_rel_path(&rel.to_string_lossy());
+            let rel_canon = canonical_note_color_key(&rel_str);
+            let color = source_note_colors
+                .get(&rel_str)
+                .or_else(|| source_note_colors.get(&rel_str.to_ascii_lowercase()))
+                .or_else(|| source_note_colors.get(&rel_canon))
+                .or_else(|| {
+                    rel_str
+                        .to_ascii_lowercase()
+                        .strip_suffix(".md")
+                        .and_then(|no_ext| source_note_colors.get(no_ext))
+                })
+                .cloned();
+            if let Some(color) = color {
+                if let Ok(prefix) = destination_file.strip_prefix(&destination_canon) {
+                    let dest_rel = normalize_rel_path(&prefix.to_string_lossy());
+                    let dest_key = canonical_note_color_key(&dest_rel);
+                    destination_note_colors.insert(dest_key, color);
+                }
+            }
             imported_notes += 1;
         } else {
             imported_images += 1;
@@ -381,8 +720,47 @@ fn import_obsidian_vault_notes(
         }
     }
 
+    // Merge directory-only colors from the Obsidian plugin (paths that don't end with .md)
+    // so that folder colors appear in the Bedrock vault left pane. Use canonical keys so
+    // sidebar lookups match.
+    for (path, hex) in &source_note_colors {
+        if !path.to_ascii_lowercase().ends_with(".md") {
+            let key = canonical_note_color_key(path);
+            destination_note_colors.insert(key, hex.clone());
+        }
+    }
+
     let source_display = source_canon.to_string_lossy().to_string();
     let destination_display = destination_canon.to_string_lossy().to_string();
+
+    // If we imported any note colors, merge them into the destination vault's
+    // `.bedrock/note-colors.json` so the frontend can colorize the left pane.
+    let imported_note_colors_count = destination_note_colors.len();
+    let mut imported_note_colors_map: Option<HashMap<String, String>> = None;
+    if !destination_note_colors.is_empty() {
+        let colors_path = destination_canon.join(".bedrock").join("note-colors.json");
+        let mut existing: HashMap<String, String> =
+            if let Ok(raw) = fs::read_to_string(&colors_path) {
+                serde_json::from_str::<HashMap<String, String>>(&raw)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(k, v)| (canonical_note_color_key(&k), v))
+                    .collect()
+            } else {
+                HashMap::new()
+            };
+        for (k, v) in destination_note_colors {
+            existing.insert(k, v);
+        }
+        imported_note_colors_map = Some(existing.clone());
+        let dir = destination_canon.join(".bedrock");
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let mut f = fs::File::create(&colors_path).map_err(|e| e.to_string())?;
+        let json =
+            serde_json::to_string_pretty(&existing).map_err(|e| e.to_string())?;
+        f.write_all(json.as_bytes()).map_err(|e| e.to_string())?;
+        f.sync_all().map_err(|e| e.to_string())?;
+    }
 
     Ok(VaultImportReport {
         success: true,
@@ -402,6 +780,9 @@ fn import_obsidian_vault_notes(
         scanned_images,
         imported_images,
         renamed_notes,
+        imported_note_colors: imported_note_colors_count,
+        imported_note_colors_map,
+        imported_note_color_palette: imported_palette,
     })
 }
 
@@ -514,13 +895,17 @@ fn rewrite_wiki_links(
 
 #[tauri::command]
 fn read_dir(path: &str) -> Result<ReadDirResult, String> {
-    let root = Path::new(path);
+    let root = session::canonicalize_vault_root(path.trim());
     if !root.exists() {
-        return Ok(ReadDirResult { notes: Vec::new(), empty_dirs: Vec::new() });
+        return Ok(ReadDirResult {
+            notes: Vec::new(),
+            empty_dirs: Vec::new(),
+        });
     }
-    let notes = collect_note_paths(path)?;
+    let root_str = root.to_string_lossy().to_string();
+    let notes = collect_note_paths(&root_str)?;
     let mut all_dirs = Vec::new();
-    collect_relative_dirs(root, root, &mut all_dirs)?;
+    collect_relative_dirs(&root, &root, &mut all_dirs)?;
     let empty_dirs = all_dirs
         .into_iter()
         .filter(|d| {
@@ -681,9 +1066,32 @@ fn init_vault(app_handle: tauri::AppHandle) -> Result<String, String> {
     let needs_welcome = !vault_path.exists();
     ensure_bedrock_layout(&vault_path)?;
     if needs_welcome {
-        // Create an initial welcome file
+        // Create initial welcome file with structure for seven-goals verification (headings, tags, wiki-links).
         let welcome_path = vault_path.join("Welcome.md");
-        fs::write(&welcome_path, "# Welcome to Bedrock\n\nBedrock is a fast, premium markdown note-taking tool.\n\n- Powered by **Rust** and **Tauri**\n- Extensible via CSS variables and plugins.\n").map_err(|e| e.to_string())?;
+        let welcome_content = r#"# Welcome to Bedrock
+
+Bedrock is a fast, premium markdown note-taking tool.
+
+## Features
+
+- Powered by **Rust** and **Tauri**
+- Extensible via CSS variables and plugins
+- See [[Getting Started]] for next steps
+
+## Quick links
+
+- [[Getting Started]]
+- Tags: #welcome #bedrock #demo
+"#;
+        fs::write(&welcome_path, welcome_content).map_err(|e| e.to_string())?;
+        let getting_started_path = vault_path.join("Getting Started.md");
+        let getting_started_content = r#"# Getting Started
+
+Return to [[Welcome]] to see the main overview.
+
+Tags: #getting-started #demo
+"#;
+        fs::write(&getting_started_path, getting_started_content).map_err(|e| e.to_string())?;
     }
 
     let canon = vault_path
@@ -708,6 +1116,219 @@ fn load_plugins_css(vault_path: &str) -> Result<String, String> {
         }
     }
     Ok(compiled_css)
+}
+
+#[tauri::command]
+fn load_note_colors(vault_path: &str) -> Result<LoadNoteColorsResult, String> {
+    let vault_path = vault_path.trim();
+    let root = session::canonicalize_vault_root(vault_path);
+    let canonical = root.to_string_lossy().to_string();
+    eprintln!(
+        "[Bedrock] load_note_colors vault root: {} (hybrid: {})",
+        root.display(),
+        is_hybrid_vault(&root)
+    );
+    let note_colors_path = root.join(".bedrock").join("note-colors.json");
+
+    let try_obsidian_fallback = || {
+        let data = load_obsidian_file_color_data(&root)?;
+        let map = obsidian_file_color_to_map(&data);
+        if map.is_empty() && !data.file_colors.is_empty() {
+            eprintln!(
+                "[Bedrock] obsidian-file-color: {} fileColor(s) but 0 resolved — check palette uses \"value\" or \"color\" for hex",
+                data.file_colors.len()
+            );
+        }
+        if map.is_empty() {
+            return None;
+        }
+        Some((map, data))
+    };
+
+    let sync_obsidian_to_bedrock = |data: &ObsidianFileColorData| {
+        if !is_hybrid_vault(&root) {
+            return;
+        }
+        let dir = root.join(".bedrock").join("obsidian-file-color");
+        if fs::create_dir_all(&dir).is_ok() {
+            let path = dir.join("data.json");
+            if let Ok(json) = serde_json::to_string_pretty(data) {
+                let _ = fs::File::create(&path).and_then(|mut f| {
+                    f.write_all(json.as_bytes())?;
+                    f.sync_all()
+                });
+            }
+        }
+    };
+
+    if note_colors_path.is_file() {
+        let raw = match fs::read_to_string(&note_colors_path) {
+            Ok(s) => s,
+            Err(_) => return Ok(LoadNoteColorsResult { canonical_vault_path: canonical.clone(), colors: HashMap::new() }),
+        };
+        let parsed = serde_json::from_str::<HashMap<String, String>>(&raw)
+            .unwrap_or_default();
+        let normalized: HashMap<String, String> = parsed
+            .into_iter()
+            .map(|(k, v)| (canonical_note_color_key(&k), v))
+            .collect();
+        // If we have entries, use them.
+        if !normalized.is_empty() {
+            let sample: Vec<&str> = normalized.keys().take(3).map(String::as_str).collect();
+            eprintln!(
+                "[Bedrock] loaded {} note color(s) from note-colors.json for vault: {} — sample keys: {:?}",
+                normalized.len(),
+                root.display(),
+                sample
+            );
+            return Ok(LoadNoteColorsResult { canonical_vault_path: canonical, colors: normalized });
+        }
+        // note-colors.json exists but is empty (e.g. failed write or stale); try fallback.
+        if let Some((map, data)) = try_obsidian_fallback() {
+        if !map.is_empty() {
+            let sample: Vec<&str> = map.keys().take(3).map(String::as_str).collect();
+            eprintln!(
+                "[Bedrock] loaded {} note color(s) from obsidian-file-color (fallback) for vault: {} — sample keys: {:?}",
+                map.len(),
+                root.display(),
+                sample
+            );
+        }
+            sync_obsidian_to_bedrock(&data);
+            let dir = root.join(".bedrock");
+            let _ = fs::create_dir_all(&dir);
+            let path = dir.join("note-colors.json");
+            if let Ok(json) = serde_json::to_string_pretty(&map) {
+                let _ = fs::File::create(&path).and_then(|mut f| {
+                    f.write_all(json.as_bytes())?;
+                    f.sync_all()
+                });
+            }
+            return Ok(LoadNoteColorsResult { canonical_vault_path: canonical, colors: map });
+        }
+        return Ok(LoadNoteColorsResult { canonical_vault_path: canonical, colors: normalized });
+    }
+
+    // Fallback: Bedrock vault may have a copy of obsidian-file-color data (e.g. from a prior
+    // import or manual copy). Load it so left-pane colors work without re-importing.
+    // Map keys use canonical_note_color_key so Obsidian paths (e.g. "MentalHealth") match
+    // filesystem paths (e.g. "Mental-health") in the sidebar.
+    // For hybrid vaults, sync the loaded Obsidian data to .bedrock so both stay in sync.
+    if let Some((map, data)) = try_obsidian_fallback() {
+        if !map.is_empty() {
+            let sample: Vec<&str> = map.keys().take(3).map(String::as_str).collect();
+            eprintln!(
+                "[Bedrock] loaded {} note color(s) from obsidian-file-color for vault: {} — sample keys: {:?}",
+                map.len(),
+                root.display(),
+                sample
+            );
+        }
+        sync_obsidian_to_bedrock(&data);
+        let dir = root.join(".bedrock");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("note-colors.json");
+        if let Ok(json) = serde_json::to_string_pretty(&map) {
+            let _ = fs::File::create(&path).and_then(|mut f| {
+                f.write_all(json.as_bytes())?;
+                f.sync_all()
+            });
+        }
+        return Ok(LoadNoteColorsResult { canonical_vault_path: canonical, colors: map });
+    }
+    eprintln!(
+        "[Bedrock] load_note_colors: returning 0 colors for vault: {} (no note-colors.json or obsidian-file-color data)",
+        root.display()
+    );
+    Ok(LoadNoteColorsResult { canonical_vault_path: canonical, colors: HashMap::new() })
+}
+
+#[tauri::command]
+fn canonicalize_vault_path(vault_path: &str) -> Result<String, String> {
+    let root = session::canonicalize_vault_root(vault_path.trim());
+    Ok(root.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn load_note_color_palette(vault_path: &str) -> Result<Vec<NoteColorPaletteEntry>, String> {
+    let vault_path = vault_path.trim();
+    let root = session::canonicalize_vault_root(vault_path);
+    let paths = if is_hybrid_vault(&root) {
+        vec![
+            root.join(".obsidian")
+                .join("plugins")
+                .join("obsidian-file-color")
+                .join("data.json"),
+            root.join(".bedrock")
+                .join("obsidian-file-color")
+                .join("data.json"),
+        ]
+    } else {
+        vec![
+            root.join(".bedrock")
+                .join("obsidian-file-color")
+                .join("data.json"),
+            root.join(".obsidian")
+                .join("plugins")
+                .join("obsidian-file-color")
+                .join("data.json"),
+        ]
+    };
+    for path in paths {
+        if path.is_file() {
+            if let Ok(raw) = fs::read_to_string(&path) {
+                if let Ok(data) = serde_json::from_str::<ObsidianFileColorData>(&raw) {
+                    let palette = data
+                        .palette
+                        .into_iter()
+                        .filter(|e| !e.color.trim().is_empty())
+                        .map(|e| NoteColorPaletteEntry {
+                            id: e.id,
+                            name: e.name,
+                            value: e.color,
+                        })
+                        .collect();
+                    return Ok(palette);
+                }
+            }
+        }
+    }
+    Ok(Vec::new())
+}
+
+#[tauri::command]
+fn save_note_colors(
+    vault_path: &str,
+    colors: HashMap<String, String>,
+) -> Result<(), String> {
+    let vault_path = vault_path.trim();
+    let root = session::canonicalize_vault_root(vault_path);
+    let dir = root.join(".bedrock");
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join("note-colors.json");
+    let json = serde_json::to_string_pretty(&colors).map_err(|e| e.to_string())?;
+    let mut f = fs::File::create(&path).map_err(|e| e.to_string())?;
+    f.write_all(json.as_bytes()).map_err(|e| e.to_string())?;
+    f.sync_all().map_err(|e| e.to_string())?;
+
+    // Hybrid vault: sync same data to .obsidian/plugins/obsidian-file-color so Obsidian and Bedrock stay in sync.
+    if is_hybrid_vault(&root) {
+        let existing = load_obsidian_file_color_data(&root);
+        let data = build_obsidian_file_color_data(&root, &colors, existing.as_ref());
+        let json_data = serde_json::to_string_pretty(&data).map_err(|e| e.to_string())?;
+        let bedrock_plugin = root.join(".bedrock").join("obsidian-file-color");
+        let _ = fs::create_dir_all(&bedrock_plugin);
+        let _ = fs::write(bedrock_plugin.join("data.json"), &json_data);
+        let obsidian_plugin = root
+            .join(".obsidian")
+            .join("plugins")
+            .join("obsidian-file-color");
+        if fs::create_dir_all(&obsidian_plugin).is_ok() {
+            let _ = fs::write(obsidian_plugin.join("data.json"), &json_data);
+        }
+    }
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -889,6 +1510,250 @@ mod import_tests {
         let _ = fs::remove_dir_all(source);
         let _ = fs::remove_dir_all(destination);
     }
+
+    #[test]
+    fn imports_obsidian_file_color_palette_into_note_colors() {
+        let source = unique_temp_dir("obsidian-source-file-color");
+        let destination = unique_temp_dir("bedrock-destination-file-color");
+
+        // Minimal Obsidian vault layout with the file-color plugin enabled.
+        fs::create_dir_all(
+            source.join(".obsidian/plugins/obsidian-file-color"),
+        )
+        .unwrap();
+        fs::create_dir_all(source.join("Notes")).unwrap();
+        fs::create_dir_all(source.join("Personal")).unwrap();
+
+        // Notes that should be imported.
+        fs::write(
+            source.join("Notes/Project Alpha.md"),
+            "# Project Alpha\n",
+        )
+        .unwrap();
+        fs::write(
+            source.join("Personal/Journal.md"),
+            "# Journal\n",
+        )
+        .unwrap();
+
+        // Obsidian `obsidian-file-color` data.json matching the documented shape.
+        let plugin_data = r##"{
+  "palette": [
+    { "id": "12345", "name": "Urgent", "color": "#ff0000" }
+  ],
+  "fileColors": [
+    { "path": "Notes/Project Alpha.md", "color": "12345" },
+    { "path": "Personal/Journal", "color": "12345" }
+  ],
+  "cascadeColors": false,
+  "backgroundColors": true
+}"##;
+        fs::write(
+            source.join(".obsidian/plugins/obsidian-file-color/data.json"),
+            plugin_data,
+        )
+        .unwrap();
+
+        let report = import_obsidian_vault_notes(&source, &destination).unwrap();
+        assert!(report.success);
+        assert_eq!(report.imported_notes, 2);
+        assert_eq!(
+            report.imported_note_colors, 3,
+            "Notes/Project Alpha.md, Personal/Journal.md, Personal/Journal (dir) => 3 color entries"
+        );
+
+        // Notes exist in the destination vault.
+        assert!(destination.join("Notes/Project Alpha.md").exists());
+        assert!(destination.join("Personal/Journal.md").exists());
+
+        // Colors were merged into `.bedrock/note-colors.json` with vault-relative paths (lowercase keys).
+        let colors_path = destination.join(".bedrock/note-colors.json");
+        let raw = fs::read_to_string(&colors_path).unwrap();
+        let parsed: HashMap<String, String> =
+            serde_json::from_str(&raw).expect("valid colors map");
+
+        assert_eq!(
+            parsed.get("notes/project alpha.md"),
+            Some(&"#ff0000".to_string())
+        );
+        // The plugin uses "Personal/Journal" (without `.md`); we support that by
+        // also inserting a key with `.md` when building source_note_colors.
+        assert_eq!(
+            parsed.get("personal/journal.md"),
+            Some(&"#ff0000".to_string())
+        );
+        // Directory-only path from the plugin (path without .md) must also be present
+        // so folder colouring works in the left pane.
+        assert_eq!(
+            parsed.get("personal/journal"),
+            Some(&"#ff0000".to_string()),
+            "directory colors from obsidian-file-color must be imported"
+        );
+
+        let _ = fs::remove_dir_all(source);
+        let _ = fs::remove_dir_all(destination);
+    }
+
+    /// Real obsidian-file-color plugin uses "value" for hex in palette, not "color".
+    #[test]
+    fn imports_obsidian_file_color_palette_with_value_field() {
+        let source = unique_temp_dir("obsidian-source-value");
+        let destination = unique_temp_dir("bedrock-destination-value");
+
+        fs::create_dir_all(source.join(".obsidian/plugins/obsidian-file-color")).unwrap();
+        fs::create_dir_all(source.join("Gaming")).unwrap();
+
+        fs::write(source.join("Gaming/Note.md"), "# Gaming\n").unwrap();
+
+        // Same shape as real plugin: palette uses "value", not "color".
+        let plugin_data = r##"{
+  "cascadeColors": false,
+  "colorBackground": false,
+  "palette": [
+    { "id": "red-id", "name": "Red", "value": "#ff0000" },
+    { "id": "blue-id", "name": "Blue", "value": "#001eff" }
+  ],
+  "fileColors": [
+    { "path": "Gaming", "color": "red-id" },
+    { "path": "Gaming/Note.md", "color": "blue-id" }
+  ]
+}"##;
+        fs::write(
+            source.join(".obsidian/plugins/obsidian-file-color/data.json"),
+            plugin_data,
+        )
+        .unwrap();
+
+        let report = import_obsidian_vault_notes(&source, &destination).unwrap();
+        assert!(report.success);
+        assert_eq!(report.imported_notes, 1);
+        assert_eq!(report.imported_note_colors, 2, "Gaming (dir) + Gaming/Note.md");
+
+        let colors_path = destination.join(".bedrock/note-colors.json");
+        let raw = fs::read_to_string(&colors_path).unwrap();
+        let parsed: HashMap<String, String> = serde_json::from_str(&raw).unwrap();
+
+        assert_eq!(parsed.get("gaming"), Some(&"#ff0000".to_string()));
+        assert_eq!(parsed.get("gaming/note.md"), Some(&"#001eff".to_string()));
+
+        let _ = fs::remove_dir_all(source);
+        let _ = fs::remove_dir_all(destination);
+    }
+
+    /// load_note_colors falls back to .bedrock/obsidian-file-color/data.json when
+    /// note-colors.json is missing (e.g. Bedrock vault with plugin data copied in).
+    #[test]
+    fn load_note_colors_fallback_obsidian_file_color() {
+        let vault = unique_temp_dir("vault-load-colors-fallback");
+        fs::create_dir_all(vault.join(".bedrock/obsidian-file-color")).unwrap();
+        let plugin_data = r##"{
+  "palette": [ { "id": "c1", "name": "Red", "value": "#ff0000" } ],
+  "fileColors": [
+    { "path": "Gaming", "color": "c1" },
+    { "path": "Dev/Note.md", "color": "c1" }
+  ]
+}"##;
+        fs::write(
+            vault.join(".bedrock/obsidian-file-color/data.json"),
+            plugin_data,
+        )
+        .unwrap();
+
+        let colors = load_note_colors(vault.to_str().unwrap()).unwrap();
+        assert_eq!(colors.colors.get("gaming"), Some(&"#ff0000".to_string()));
+        assert_eq!(colors.colors.get("dev/note.md"), Some(&"#ff0000".to_string()));
+
+        // Fallback persists to note-colors.json so next launch and UI have consistent data.
+        let colors_path = vault.join(".bedrock/note-colors.json");
+        assert!(colors_path.is_file(), "fallback should write note-colors.json");
+        let raw = fs::read_to_string(&colors_path).unwrap();
+        let persisted: HashMap<String, String> = serde_json::from_str(&raw).unwrap();
+        assert_eq!(persisted.get("gaming"), Some(&"#ff0000".to_string()));
+        assert_eq!(persisted.get("dev/note.md"), Some(&"#ff0000".to_string()));
+
+        let _ = fs::remove_dir_all(vault);
+    }
+
+    /// When fileColors[].color is a hex string (no palette id match), we still produce a non-empty map.
+    #[test]
+    fn load_note_colors_hex_in_file_colors() {
+        let vault = unique_temp_dir("vault-hex-file-colors");
+        fs::create_dir_all(vault.join(".bedrock/obsidian-file-color")).unwrap();
+        // Plugin variant that stores hex directly in fileColors (no palette, or palette ids don't match).
+        let plugin_data = r##"{
+  "palette": [],
+  "fileColors": [
+    { "path": "AI", "color": "#22c55e" },
+    { "path": "Gaming", "color": "#3B82F6" }
+  ]
+}"##;
+        fs::write(
+            vault.join(".bedrock/obsidian-file-color/data.json"),
+            plugin_data,
+        )
+        .unwrap();
+
+        let colors = load_note_colors(vault.to_str().unwrap()).unwrap();
+        assert_eq!(colors.colors.get("ai"), Some(&"#22c55e".to_string()));
+        assert_eq!(colors.colors.get("gaming"), Some(&"#3b82f6".to_string()));
+
+        let _ = fs::remove_dir_all(vault);
+    }
+
+    /// Hybrid vault: both .obsidian and .bedrock exist; we load from the source with
+    /// the most fileColors and sync to .bedrock so both stay in sync.
+    #[test]
+    fn load_note_colors_hybrid_vault_prefers_most_file_colors() {
+        let vault = unique_temp_dir("vault-hybrid-file-colors");
+        fs::create_dir_all(vault.join(".obsidian/plugins/obsidian-file-color")).unwrap();
+        fs::create_dir_all(vault.join(".bedrock/obsidian-file-color")).unwrap();
+
+        // Obsidian plugin has 2 fileColors
+        let obsidian_data = r##"{
+  "palette": [ { "id": "c1", "name": "Red", "value": "#ff0000" } ],
+  "fileColors": [
+    { "path": "AI", "color": "c1" },
+    { "path": "Gaming", "color": "c1" }
+  ]
+}"##;
+        fs::write(
+            vault.join(".obsidian/plugins/obsidian-file-color/data.json"),
+            obsidian_data,
+        )
+        .unwrap();
+
+        // .bedrock copy has 3 fileColors (more than Obsidian)
+        let bedrock_data = r##"{
+  "palette": [ { "id": "c1", "name": "Red", "value": "#ff0000" } ],
+  "fileColors": [
+    { "path": "AI", "color": "c1" },
+    { "path": "Gaming", "color": "c1" },
+    { "path": "Dev", "color": "c1" }
+  ]
+}"##;
+        fs::write(
+            vault.join(".bedrock/obsidian-file-color/data.json"),
+            bedrock_data,
+        )
+        .unwrap();
+
+        let colors = load_note_colors(vault.to_str().unwrap()).unwrap();
+        // Should prefer the source with more fileColors (.bedrock has 3); map also adds .md variants
+        assert!(colors.colors.len() >= 3);
+        assert_eq!(colors.colors.get("ai"), Some(&"#ff0000".to_string()));
+        assert_eq!(colors.colors.get("gaming"), Some(&"#ff0000".to_string()));
+        assert_eq!(colors.colors.get("dev"), Some(&"#ff0000".to_string()));
+
+        // Fallback should persist to note-colors.json and sync .bedrock copy
+        let note_colors_path = vault.join(".bedrock/note-colors.json");
+        assert!(note_colors_path.is_file());
+        let raw = fs::read_to_string(&note_colors_path).unwrap();
+        let persisted: HashMap<String, String> = serde_json::from_str(&raw).unwrap();
+        assert_eq!(persisted.get("ai"), Some(&"#ff0000".to_string()));
+        assert_eq!(persisted.get("dev"), Some(&"#ff0000".to_string()));
+
+        let _ = fs::remove_dir_all(vault);
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -910,6 +1775,10 @@ pub fn run() {
             rename_note,
             init_vault,
             load_plugins_css,
+            load_note_colors,
+            canonicalize_vault_path,
+            load_note_color_palette,
+            save_note_colors,
             save_settings,
             load_settings,
             open_settings_window,

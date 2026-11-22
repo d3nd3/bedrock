@@ -3,6 +3,7 @@ use crate::app_state::{
 };
 use js_sys::{Object, Reflect};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsValue;
 
@@ -58,6 +59,12 @@ struct SaveRecentNotesArgs<'a> {
     entries: &'a [RecentNoteEntry],
 }
 
+#[derive(Serialize)]
+struct SaveNoteColorsArgs<'a> {
+    vault_path: &'a str,
+    colors: &'a HashMap<String, String>,
+}
+
 pub async fn read_dir(path: &str) -> ReadDirResult {
     let args = serde_wasm_bindgen::to_value(&ReadDirArgs { path }).unwrap();
     let dir_val = invoke("read_dir", args).await;
@@ -93,6 +100,38 @@ pub async fn load_plugins_css(vault_path: &str) -> Option<String> {
     css_val.as_string()
 }
 
+pub async fn load_note_colors(vault_path: &str) -> crate::app_state::LoadNoteColorsResult {
+    let vault_args =
+        serde_wasm_bindgen::to_value(&VaultPathArgs { vault_path }).unwrap();
+    let val = invoke("load_note_colors", vault_args).await;
+    match serde_wasm_bindgen::from_value::<crate::app_state::LoadNoteColorsResult>(val) {
+        Ok(m) => m,
+        Err(e) => {
+            let msg = format!("[Bedrock] load_note_colors deserialize failed: {:?}", e);
+            web_sys::console::warn_1(&JsValue::from_str(&msg));
+            crate::app_state::LoadNoteColorsResult {
+                canonical_vault_path: String::new(),
+                colors: HashMap::new(),
+            }
+        }
+    }
+}
+
+pub async fn canonicalize_vault_path(vault_path: &str) -> String {
+    let vault_args =
+        serde_wasm_bindgen::to_value(&VaultPathArgs { vault_path }).unwrap();
+    let val = invoke("canonicalize_vault_path", vault_args).await;
+    val.as_string().unwrap_or_else(|| vault_path.to_string())
+}
+
+pub async fn load_note_color_palette(vault_path: &str) -> Vec<crate::app_state::NoteColorPaletteEntry> {
+    let vault_args =
+        serde_wasm_bindgen::to_value(&VaultPathArgs { vault_path }).unwrap();
+    let val = invoke("load_note_color_palette", vault_args).await;
+    serde_wasm_bindgen::from_value::<Vec<crate::app_state::NoteColorPaletteEntry>>(val)
+        .unwrap_or_default()
+}
+
 pub async fn load_settings(vault_path: &str) -> Option<String> {
     let vault_args =
         serde_wasm_bindgen::to_value(&VaultPathArgs { vault_path }).unwrap();
@@ -109,6 +148,13 @@ pub async fn save_settings(vault_path: &str, settings: &AppSettings) {
         .unwrap();
         invoke("save_settings", args).await;
     }
+}
+
+pub async fn save_note_colors(vault_path: &str, colors: &HashMap<String, String>) {
+    let args =
+        serde_wasm_bindgen::to_value(&SaveNoteColorsArgs { vault_path, colors })
+            .unwrap();
+    let _ = invoke("save_note_colors", args).await;
 }
 
 pub async fn read_file(path: &str) -> Option<String> {

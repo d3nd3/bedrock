@@ -8,6 +8,14 @@ pub struct RecentNoteEntry {
     pub last_opened: i64,
 }
 
+/// A single palette entry for note label colors (from obsidian-file-color data.json).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct NoteColorPaletteEntry {
+    pub id: String,
+    pub name: String,
+    pub value: String,
+}
+
 #[derive(Deserialize, Clone, Debug)]
 pub struct VaultNote {
     pub path: String,
@@ -26,6 +34,20 @@ pub struct VaultImportReport {
     pub scanned_images: usize,
     pub imported_images: usize,
     pub renamed_notes: usize,
+    #[serde(default)]
+    pub imported_note_colors: usize,
+    /// When note colors were imported, the full path→hex map for first-paint display.
+    #[serde(default)]
+    pub imported_note_colors_map: Option<HashMap<String, String>>,
+    /// When data.json was imported, the palette (id, name, value) for the "Label color" menu.
+    #[serde(default)]
+    pub imported_note_color_palette: Option<Vec<NoteColorPaletteEntry>>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct LoadNoteColorsResult {
+    pub canonical_vault_path: String,
+    pub colors: HashMap<String, String>,
 }
 
 #[derive(Deserialize, Clone, Debug, Default)]

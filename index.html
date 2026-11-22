@@ -12,6 +12,8 @@
 <body>
   <script>
     window.addEventListener("DOMContentLoaded", () => {
+      // Prevent the browser/WebView context menu so Bedrock's custom sidebar menu (Label color, Clear color) can show.
+      document.addEventListener("contextmenu", (e) => e.preventDefault(), { capture: true });
       if (window.__TAURI__ && window.__TAURI__.event) {
         window.__TAURI__.event.listen('settings-updated', (e) => {
           window.dispatchEvent(new CustomEvent('bedrock-settings', { detail: e.payload }));

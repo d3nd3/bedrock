@@ -25,7 +25,7 @@
   --font-mono: 'JetBrains Mono', monospace;
 
   /* Sizing Constraints */
-  --sidebar-width: 250px;
+  --sidebar-width: 280px;
   --topbar-height: 48px;
 
   /* Effects */
@@ -52,6 +52,19 @@
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+}
+
+/* Sidebar tab row: keep Search, Files, Recent notes always visible (grid prevents clipping) */
+.sidebar-tab-row {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  min-width: 0;
+}
+.sidebar-tab-row button {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -94,7 +107,49 @@ html {
 
 #root {
   height: 100%;
+  width: 100%;
+  min-width: 0;
   display: flex;
+  overflow: hidden;
+}
+
+/* Sidebar and main content: prevent overflow and keep UI elements visible */
+.sidebar {
+  flex-shrink: 0;
+}
+.file-list {
+  min-width: 0;
+}
+
+/* Ensure label colours from obsidian-file-color are visible; inline style sets --label-color + border. */
+/* Class-based selector so coloured rows are styled even if data attribute timing differs. */
+.folder-item.has-label-color,
+.file-item.has-label-color {
+  box-sizing: border-box;
+  border-left-width: 4px !important;
+  border-left-style: solid !important;
+  border-left-color: var(--label-color, var(--accent-color)) !important;
+  background: color-mix(in srgb, var(--label-color, var(--accent-color)) 14%, transparent) !important;
+}
+/* Ensure name text (folder/file label) uses label color so it's visible even if inline style is delayed. */
+.folder-item.has-label-color > span:nth-child(2),
+.file-item.has-label-color > span {
+  color: var(--label-color, var(--accent-color)) !important;
+}
+.folder-item[data-has-label-color="true"],
+.file-item[data-has-label-color="true"] {
+  box-sizing: border-box;
+  border-left-width: 4px !important;
+  border-left-style: solid !important;
+  border-left-color: var(--label-color, var(--accent-color)) !important;
+  background: color-mix(in srgb, var(--label-color, var(--accent-color)) 12%, transparent) !important;
+}
+.folder-item[data-has-label-color="true"] > span:nth-child(2),
+.file-item[data-has-label-color="true"] > span {
+  color: var(--label-color, var(--accent-color)) !important;
+}
+.editor-pane {
+  min-width: 0;
 }
 
 /* Scrollbar styling for premium feel */
