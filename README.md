@@ -2,7 +2,10 @@
 
 **Bedrock** is a lightning-fast, premium, cross-platform markup note-taking tool. Built entirely in Rust from the ground up, it ensures maximum performance while offering incredible extensibility for aesthetic and behavioral plugins.
 
+Prefer pictures? Start with **[HUMANS.md](HUMANS.md)**.
+
 ## Features
+
 - **Pure Rust Architecture**: Powered by Tauri v2 and Leptos (WASM), delivering native-level speeds everywhere.
 - **Cross-Platform**: Designed for macOS, Windows, Linux, iOS, and Android.
 - **Local-First**: Notes are stored purely as local `.md` files in your BedrockVault. No databases, no sync servers required.

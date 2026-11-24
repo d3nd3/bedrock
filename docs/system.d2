@@ -1,0 +1,48 @@
+# Bedrock — local-first markdown notes, Tauri v2 shell plus Leptos WASM UI
+# Strokes only (no fills) so light/dark themes both stay readable.
+direction: right
+
+classes: {
+  entry: {style: {stroke: "#4f9cf9"; stroke-width: 2}}
+  core: {style: {stroke: "#9a7cf9"}}
+  state: {style: {stroke: "#e0a44a"}}
+  ext: {style: {stroke: "#6ac48a"; stroke-dash: 4}}
+  store: {style: {stroke: "#e0a44a"; stroke-width: 2}}
+}
+
+entry: Entry points {
+  direction: down
+  trunk: "trunk build to dist/ · cargo tauri dev for a desktop run, bundle for installers" {class: entry}
+  main: "src/main.rs · mounts the Leptos App, csr feature, everything runs in WASM" {class: entry}
+  app: "src/app.rs 3300 lines · the shell state machine, vault, tabs, editor and menus" {class: entry}
+}
+
+core: Core {
+  direction: down
+  editor_core: "editor_core.rs · CM6-style state plus transaction kernel, 584 lines" {class: core}
+  syntax: "markdown_syntax.rs 1850 lines · live styling grammar over the raw text" {class: core}
+  sidebar: "sidebar_panel.rs + sidebar_tree.rs · vault tree, context menu, label colors" {class: core}
+  meta: "metadata_sidebar.rs · headings, tags, links, backlinks and unlinked mentions" {class: core}
+  tabs: "vault_tabs.rs + recent_notes_pane.rs · several vaults open at once" {class: core}
+  bridge: "tauri_bridge.rs · the only door into Rust, 24 invoke calls with typed args" {class: core}
+  cmds: "src-tauri/src/lib.rs · read, write, rename with wiki-link rewrite, vault import, pickers" {class: core}
+  sess: "src-tauri/src/session.rs · vault session and recent-note cache" {class: core}
+}
+
+state: State {
+  direction: down
+  notes: "the vault itself · plain .md files, no database and no index on disk" {class: store}
+  bedrock: ".bedrock/ per vault · vault-session.json, recent.json, obsidian-file-color data" {class: store}
+  settings: "settings.json plus .plugins/*.css per vault · theme variables and plugin CSS" {class: store}
+}
+
+external: External {
+  direction: down
+  webview: "WebView2, WKWebView or WebKitGTK · renders the WASM bundle" {class: ext}
+  dialog: "native file dialogs · vault picker and Obsidian vault import" {class: ext}
+  obsidian: "an Obsidian vault on disk · notes, images and obsidian-file-color data.json" {class: ext}
+}
+
+entry -> core
+core -> state
+core -> external
